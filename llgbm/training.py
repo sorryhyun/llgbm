@@ -260,11 +260,12 @@ def compute_delta_for_batch(
         Delta activations (B, hidden_size)
     """
     batch_size = condition_ids.shape[0]
+    device = condition_ids.device
 
     # Generate LoRA weights
     lora_weights_batch = generator(condition_ids, attention_mask)
 
-    # Compute delta for each sample
+    # Compute delta for each sample with memory cleanup
     deltas = []
     for i in range(batch_size):
         lora_weights = lora_weights_batch[i]
@@ -276,6 +277,10 @@ def compute_delta_for_batch(
             probe_masks=probe_masks,
         )
         deltas.append(delta)
+
+        # Clear intermediate activations from functional_call
+        if device.type == "cuda" and i < batch_size - 1:
+            torch.cuda.empty_cache()
 
     return torch.stack(deltas)
 

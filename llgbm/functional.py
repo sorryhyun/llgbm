@@ -9,7 +9,7 @@ Memory Optimization Notes:
 - Clears CUDA cache between operations
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 
@@ -73,18 +73,17 @@ class FunctionalLoRA:
     def apply_lora_weights(
         self,
         lora_weights: Dict[str, torch.Tensor],
-    ) -> Tuple[Dict[str, torch.Tensor], List[torch.Tensor]]:
+    ) -> Dict[str, torch.Tensor]:
         """
         Create a new parameter dict with LoRA weights applied.
 
-        Returns both the effective params AND a list of delta tensors
-        to ensure gradient flow.
+        Gradient flows through the delta computation (B @ A * scaling).
 
         Args:
             lora_weights: Dict mapping LoRA weight names to tensors
 
         Returns:
-            Tuple of (effective_params dict, list of delta tensors for gradient tracking)
+            Dict of effective parameters with LoRA applied
         """
         base_params = dict(self.base_model.named_parameters())
 
@@ -103,19 +102,16 @@ class FunctionalLoRA:
 
         self._matched_count = len(lora_pairs)
 
-        # Apply LoRA modifications - track deltas for gradient flow
+        # Apply LoRA modifications
         new_params = {}
-        delta_tensors = []  # Keep references to ensure gradient flow
 
         for base_name, base_param in base_params.items():
             if base_name in lora_pairs and "A" in lora_pairs[base_name] and "B" in lora_pairs[base_name]:
                 lora_A = lora_pairs[base_name]["A"]
                 lora_B = lora_pairs[base_name]["B"]
 
-                # Keep computation in original dtype, convert at the end
-                # delta = B @ A * scaling
+                # delta = B @ A * scaling (gradient flows through this)
                 delta = torch.matmul(lora_B, lora_A) * self.scaling
-                delta_tensors.append(delta)
 
                 # Convert delta to match base param dtype/device
                 delta = delta.to(dtype=base_param.dtype, device=base_param.device)
@@ -126,7 +122,7 @@ class FunctionalLoRA:
                 # Keep original (detached to be consistent)
                 new_params[base_name] = base_param.detach()
 
-        return new_params, delta_tensors
+        return new_params
 
     def forward_with_lora(
         self,
@@ -147,7 +143,7 @@ class FunctionalLoRA:
         Returns:
             Model outputs
         """
-        effective_params, _ = self.apply_lora_weights(lora_weights)
+        effective_params = self.apply_lora_weights(lora_weights)
 
         return torch.func.functional_call(
             self.base_model,
@@ -184,7 +180,10 @@ def compute_delta_differentiable(
         Delta tensor of shape (hidden_size,) with gradient support
     """
     device = base_activation.device
-    activations = []
+    num_probes = len(probe_tokens)
+
+    # Accumulate activations incrementally to reduce peak memory
+    activation_sum = None
 
     for input_ids, attention_mask in zip(probe_tokens, probe_masks):
         outputs = functional_lora.forward_with_lora(
@@ -195,11 +194,18 @@ def compute_delta_differentiable(
         )
         hidden = outputs.hidden_states[-1]
         seq_len = int(attention_mask.sum().item())
-        last_token_hidden = hidden[:, seq_len - 1, :].squeeze(0)
-        # Keep in compute dtype, convert to float32 for stable accumulation
-        activations.append(last_token_hidden.float())
+        last_token_hidden = hidden[:, seq_len - 1, :].squeeze(0).float()
 
-    lora_activation = torch.stack(activations).mean(dim=0)
+        # Accumulate instead of storing all activations
+        if activation_sum is None:
+            activation_sum = last_token_hidden
+        else:
+            activation_sum = activation_sum + last_token_hidden
+
+        # Free the outputs to reduce memory pressure
+        del outputs, hidden
+
+    lora_activation = activation_sum / num_probes
     return lora_activation - base_activation.float().detach()
 
 
