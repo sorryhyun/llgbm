@@ -278,10 +278,6 @@ def compute_delta_for_batch(
         )
         deltas.append(delta)
 
-        # Clear intermediate activations from functional_call
-        if device.type == "cuda" and i < batch_size - 1:
-            torch.cuda.empty_cache()
-
     return torch.stack(deltas)
 
 

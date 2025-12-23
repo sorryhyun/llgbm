@@ -4,14 +4,21 @@ This module enables gradient flow from delta loss back to generated LoRA weights
 by using torch.func.functional_call instead of in-place weight modification.
 
 Memory Optimization Notes:
-- Uses gradient checkpointing to reduce activation memory
-- Processes probes sequentially to avoid batching overhead
-- Clears CUDA cache between operations
+- `torch.func.functional_call` + dense ΔW materialization is correct but very
+  memory hungry: it forms full matrices ΔW = (B @ A) for every target module,
+  for every layer, for every probe.
+- By default we apply LoRA in low-rank form via forward hooks (two small linear
+  ops) to avoid materializing dense ΔW and reduce OOM risk.
 """
 
-from typing import Dict, List, Optional
+from __future__ import annotations
+
+import inspect
+from typing import Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class FunctionalLoRA:
@@ -29,6 +36,7 @@ class FunctionalLoRA:
         lora_rank: int = 16,
         lora_alpha: int = 32,
         target_modules: List[str] = None,
+        mode: str = "hooks",
     ):
         """
         Args:
@@ -36,8 +44,10 @@ class FunctionalLoRA:
             lora_rank: LoRA rank
             lora_alpha: LoRA alpha scaling factor
             target_modules: List of module names to apply LoRA to
+            mode: "hooks" (default, efficient) or "functional_call" (legacy, slow/OOM-prone)
         """
         self.base_model = base_model
+        self.backbone = getattr(base_model, "model", base_model)
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.scaling = lora_alpha / lora_rank
@@ -45,6 +55,7 @@ class FunctionalLoRA:
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj"
         ]
+        self.mode = mode
 
         # Cache base parameter info
         self._base_param_names = set(dict(base_model.named_parameters()).keys())
@@ -52,6 +63,33 @@ class FunctionalLoRA:
 
         # Debug info
         self._matched_count = 0
+
+        # Hook-based application state
+        self._active_lora_weights: Optional[Dict[str, torch.Tensor]] = None
+        self._hook_handles: List[torch.utils.hooks.RemovableHandle] = []
+        self._module_key_candidates: Dict[str, Tuple[Tuple[str, str], ...]] = {}
+        self._forward_has_var_kwargs, self._forward_arg_names = self._inspect_forward(self.backbone)
+
+        if self.mode == "hooks":
+            self._register_lora_hooks()
+
+    @staticmethod
+    def _inspect_forward(model: nn.Module) -> Tuple[bool, set[str]]:
+        try:
+            sig = inspect.signature(model.forward)
+        except (TypeError, ValueError):
+            return True, set()
+
+        has_var_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        return has_var_kwargs, set(sig.parameters.keys())
+
+    def close(self) -> None:
+        """Remove registered hooks (useful in notebooks)."""
+        for h in self._hook_handles:
+            h.remove()
+        self._hook_handles.clear()
 
     def _build_lora_mapping(self) -> Dict[str, str]:
         """
@@ -69,6 +107,56 @@ class FunctionalLoRA:
                     mapping[f"{prefix}.lora_B.weight"] = base_name
                     break
         return mapping
+
+    def _register_lora_hooks(self) -> None:
+        """
+        Register forward hooks on target Linear modules.
+
+        The hook adds the LoRA update in low-rank form:
+            y = W x + scaling * (B (A x))
+
+        This avoids constructing dense ΔW = B @ A.
+        """
+        if self._hook_handles:
+            return
+
+        for module_name, module in self.backbone.named_modules():
+            if module_name.split(".")[-1] not in self.target_modules:
+                continue
+            if not isinstance(module, nn.Linear):
+                continue
+
+            candidates: List[Tuple[str, str]] = [
+                (f"{module_name}.lora_A.weight", f"{module_name}.lora_B.weight")
+            ]
+            if module_name.startswith("model."):
+                stripped = module_name[len("model.") :]
+                candidates.append((f"{stripped}.lora_A.weight", f"{stripped}.lora_B.weight"))
+            else:
+                candidates.append((f"model.{module_name}.lora_A.weight", f"model.{module_name}.lora_B.weight"))
+            self._module_key_candidates[module_name] = tuple(candidates)
+
+            def _hook(mod: nn.Module, inputs, output, *, _name: str = module_name):
+                lora = self._active_lora_weights
+                if not lora:
+                    return output
+
+                A = B = None
+                for a_key, b_key in self._module_key_candidates.get(_name, ()):
+                    if a_key in lora:
+                        A = lora.get(a_key)
+                        B = lora.get(b_key)
+                        break
+                if A is None or B is None:
+                    return output
+
+                x = inputs[0]
+                A = A.to(dtype=x.dtype, device=x.device)
+                B = B.to(dtype=x.dtype, device=x.device)
+                update = F.linear(F.linear(x, A), B) * self.scaling
+                return output + update
+
+            self._hook_handles.append(module.register_forward_hook(_hook))
 
     def apply_lora_weights(
         self,
@@ -129,7 +217,8 @@ class FunctionalLoRA:
         lora_weights: Dict[str, torch.Tensor],
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        output_hidden_states: bool = True,
+        output_hidden_states: bool = False,
+        use_cache: bool = False,
     ):
         """
         Run forward pass with LoRA weights applied functionally.
@@ -139,22 +228,41 @@ class FunctionalLoRA:
             input_ids: Input token IDs
             attention_mask: Optional attention mask
             output_hidden_states: Whether to output hidden states
+            use_cache: Whether to use KV cache (set False for training)
 
         Returns:
             Model outputs
         """
-        effective_params = self.apply_lora_weights(lora_weights)
+        if self.mode == "functional_call":
+            effective_params = self.apply_lora_weights(lora_weights)
 
-        return torch.func.functional_call(
-            self.base_model,
-            effective_params,
-            args=(),
-            kwargs={
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "output_hidden_states": output_hidden_states,
-            },
-        )
+            return torch.func.functional_call(
+                self.base_model,
+                effective_params,
+                args=(),
+                kwargs={
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "output_hidden_states": output_hidden_states,
+                },
+            )
+
+        # Efficient hook-based mode.
+        if not self._hook_handles:
+            self._register_lora_hooks()
+
+        self._active_lora_weights = lora_weights
+        try:
+            kwargs = {"input_ids": input_ids}
+            if attention_mask is not None:
+                kwargs["attention_mask"] = attention_mask
+            if self._forward_has_var_kwargs or "output_hidden_states" in self._forward_arg_names:
+                kwargs["output_hidden_states"] = output_hidden_states
+            if self._forward_has_var_kwargs or "use_cache" in self._forward_arg_names:
+                kwargs["use_cache"] = use_cache
+            return self.backbone(**kwargs)
+        finally:
+            self._active_lora_weights = None
 
 
 def compute_delta_differentiable(
@@ -179,7 +287,6 @@ def compute_delta_differentiable(
     Returns:
         Delta tensor of shape (hidden_size,) with gradient support
     """
-    device = base_activation.device
     num_probes = len(probe_tokens)
 
     # Accumulate activations incrementally to reduce peak memory
@@ -190,11 +297,21 @@ def compute_delta_differentiable(
             lora_weights=lora_weights,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,
+            output_hidden_states=False,
+            use_cache=False,
         )
-        hidden = outputs.hidden_states[-1]
-        seq_len = int(attention_mask.sum().item())
-        last_token_hidden = hidden[:, seq_len - 1, :].squeeze(0).float()
+
+        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+            hidden = outputs.last_hidden_state
+        else:
+            hidden_states = getattr(outputs, "hidden_states", None)
+            if hidden_states is None:
+                raise AttributeError("Model outputs missing `last_hidden_state` and `hidden_states`")
+            hidden = hidden_states[-1]
+
+        seq_lens = attention_mask.long().sum(dim=1).clamp(min=1) - 1
+        batch_idx = torch.arange(hidden.shape[0], device=hidden.device)
+        last_token_hidden = hidden[batch_idx, seq_lens, :].squeeze(0).float()
 
         # Accumulate instead of storing all activations
         if activation_sum is None:
@@ -202,7 +319,7 @@ def compute_delta_differentiable(
         else:
             activation_sum = activation_sum + last_token_hidden
 
-        # Free the outputs to reduce memory pressure
+        # Free Python refs (autograd saved tensors still live until backward).
         del outputs, hidden
 
     lora_activation = activation_sum / num_probes
@@ -221,26 +338,30 @@ def compute_delta_memory_efficient(
 
     For very constrained GPU memory (< 16GB), use this version.
     """
-    device = base_activation.device
-
     # Accumulate activations one by one to minimize peak memory
     activation_sum = torch.zeros_like(base_activation).float()
     num_probes = len(probe_tokens)
 
     for input_ids, attention_mask in zip(probe_tokens, probe_masks):
-        # Clear cache before each probe
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
         outputs = functional_lora.forward_with_lora(
             lora_weights=lora_weights,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,
+            output_hidden_states=False,
+            use_cache=False,
         )
-        hidden = outputs.hidden_states[-1]
-        seq_len = int(attention_mask.sum().item())
-        last_hidden = hidden[:, seq_len - 1, :].squeeze(0).float()
+
+        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+            hidden = outputs.last_hidden_state
+        else:
+            hidden_states = getattr(outputs, "hidden_states", None)
+            if hidden_states is None:
+                raise AttributeError("Model outputs missing `last_hidden_state` and `hidden_states`")
+            hidden = hidden_states[-1]
+
+        seq_lens = attention_mask.long().sum(dim=1).clamp(min=1) - 1
+        batch_idx = torch.arange(hidden.shape[0], device=hidden.device)
+        last_hidden = hidden[batch_idx, seq_lens, :].squeeze(0).float()
         activation_sum = activation_sum + last_hidden
 
     lora_activation = activation_sum / num_probes
