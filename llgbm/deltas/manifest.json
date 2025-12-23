@@ -1,0 +1,46 @@
+{
+  "adapters": {
+    "42d0f1f98448": {
+      "path": "data/teacher_checkpoints/code/code_adapter_001",
+      "norm": 1.4969524145126343,
+      "shape": [
+        1536
+      ]
+    },
+    "16e5d4bac141": {
+      "path": "data/teacher_checkpoints/code/code_adapter_002",
+      "norm": 1.4969524145126343,
+      "shape": [
+        1536
+      ]
+    },
+    "a39ef646efbd": {
+      "path": "data/teacher_checkpoints/general/general_adapter_001",
+      "norm": 1.4941619634628296,
+      "shape": [
+        1536
+      ]
+    },
+    "725c4e8d8ac2": {
+      "path": "data/teacher_checkpoints/math/math_adapter_001",
+      "norm": 1.7384544610977173,
+      "shape": [
+        1536
+      ]
+    },
+    "6090ffc17ccc": {
+      "path": "data/teacher_checkpoints/math/math_adapter_002",
+      "norm": 1.7384544610977173,
+      "shape": [
+        1536
+      ]
+    }
+  },
+  "config": {
+    "base_model": "Qwen/Qwen2.5-1.5B",
+    "probe_type": "generic",
+    "num_probes": 5,
+    "max_length": 256,
+    "dtype": "bfloat16"
+  }
+}

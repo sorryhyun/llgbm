@@ -38,9 +38,9 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_steps: int = 10
-    max_steps: int = 1000
-    eval_steps: int = 100
-    save_steps: int = 200
+    num_epochs: int = 100
+    eval_every_n_epochs: int = 10
+    save_every_n_epochs: int = 20
     log_steps: int = 10
     max_grad_norm: float = 1.0
 
@@ -407,7 +407,7 @@ def train(
     callback: Optional[Callable[[TrainingState], None]] = None,
 ) -> TrainingState:
     """
-    Main training loop.
+    Main training loop (epoch-based).
 
     Args:
         generator: Generator model
@@ -421,7 +421,7 @@ def train(
         scheduler: Learning rate scheduler
         config: Training configuration
         compute_dtype: Dtype for mixed precision
-        callback: Optional callback called after each step
+        callback: Optional callback called after each epoch
 
     Returns:
         Final TrainingState
@@ -429,18 +429,17 @@ def train(
     state = TrainingState()
     generator.train()
 
-    pbar = tqdm(total=config.max_steps, desc="Training")
+    pbar = tqdm(total=config.num_epochs, desc="Training")
 
-    accumulation_step = 0
-    running_loss = 0.0
-    running_loss_delta = 0.0
-    running_loss_weight = 0.0
+    for epoch in range(config.num_epochs):
+        state.epoch = epoch
+        accumulation_step = 0
+        running_loss = 0.0
+        running_loss_delta = 0.0
+        running_loss_weight = 0.0
+        epoch_losses = []
 
-    while state.step < config.max_steps:
         for batch in dataloader:
-            if state.step >= config.max_steps:
-                break
-
             # Training step
             losses = train_step(
                 batch=batch,
@@ -459,6 +458,7 @@ def train(
             running_loss_weight += losses.get("loss_weight", 0.0)
 
             accumulation_step += 1
+            state.step += 1
 
             # Gradient update
             if accumulation_step >= config.gradient_accumulation_steps:
@@ -476,7 +476,7 @@ def train(
                 avg_loss_delta = running_loss_delta / accumulation_step
                 avg_loss_weight = running_loss_weight / accumulation_step
 
-                state.loss_history.append(avg_loss)
+                epoch_losses.append(avg_loss)
                 state.loss_delta_history.append(avg_loss_delta)
                 state.loss_weight_history.append(avg_loss_weight)
                 state.lr_history.append(scheduler.get_last_lr()[0])
@@ -484,51 +484,50 @@ def train(
                     grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
                 )
 
-                # Logging
-                if state.step % config.log_steps == 0:
-                    pbar.set_postfix(
-                        {
-                            "loss": f"{avg_loss:.4f}",
-                            "L_d": f"{avg_loss_delta:.4f}",
-                            "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-                        }
-                    )
-
-                # Save checkpoint
-                if state.step > 0 and state.step % config.save_steps == 0:
-                    save_checkpoint(
-                        generator, optimizer, scheduler, state, config,
-                        suffix=f"_step{state.step}"
-                    )
-
-                # Save best
-                if avg_loss < state.best_loss:
-                    state.best_loss = avg_loss
-                    save_checkpoint(
-                        generator, optimizer, scheduler, state, config,
-                        suffix="_best"
-                    )
-
-                # Callback
-                if callback is not None:
-                    callback(state)
-
-                # Reset
+                # Reset accumulation
                 accumulation_step = 0
                 running_loss = 0.0
                 running_loss_delta = 0.0
                 running_loss_weight = 0.0
 
-                state.step += 1
-                pbar.update(1)
+        # End of epoch
+        epoch_avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
+        state.loss_history.append(epoch_avg_loss)
 
-                # Memory cleanup
-                if state.step % 50 == 0:
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+        # Logging
+        pbar.set_postfix(
+            {
+                "epoch": epoch + 1,
+                "loss": f"{epoch_avg_loss:.4f}",
+                "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+            }
+        )
+        pbar.update(1)
 
-        state.epoch += 1
+        # Save checkpoint every N epochs
+        if (epoch + 1) % config.save_every_n_epochs == 0:
+            save_checkpoint(
+                generator, optimizer, scheduler, state, config,
+                suffix=f"_epoch{epoch + 1}"
+            )
+
+        # Save best
+        if epoch_avg_loss < state.best_loss:
+            state.best_loss = epoch_avg_loss
+            save_checkpoint(
+                generator, optimizer, scheduler, state, config,
+                suffix="_best"
+            )
+
+        # Callback
+        if callback is not None:
+            callback(state)
+
+        # Memory cleanup every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     pbar.close()
     save_checkpoint(generator, optimizer, scheduler, state, config, suffix="_final")
