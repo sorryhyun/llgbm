@@ -1,0 +1,6 @@
+,final_loss,final_loss,best_loss,best_loss,train_time,mean_cosine,mean_cosine
+,mean,std,mean,std,mean,mean,std
+config_name,,,,,,,
+delta_only,0.0009,0.0001,0.0009,0.0001,516.5021,0.5823,0.0209
+multitask,0.0001,0.0,0.0001,0.0,495.9741,0.4664,0.01
+weight_only,0.0,0.0,0.0,0.0,454.9035,-0.021,0.0252
