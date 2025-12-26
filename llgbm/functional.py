@@ -271,6 +271,7 @@ def compute_delta_differentiable(
     base_activation: torch.Tensor,
     probe_tokens: List[torch.Tensor],
     probe_masks: List[torch.Tensor],
+    batch_probes: bool = True,
 ) -> torch.Tensor:
     """
     Compute delta embedding in a differentiable manner.
@@ -283,20 +284,42 @@ def compute_delta_differentiable(
         base_activation: Pre-computed base model activation (detached)
         probe_tokens: List of tokenized probe inputs
         probe_masks: List of attention masks for probes
+        batch_probes: If True, process all probes in a single batched forward pass
+                      for better GPU utilization. Set False for memory-constrained cases.
 
     Returns:
         Delta tensor of shape (hidden_size,) with gradient support
     """
     num_probes = len(probe_tokens)
 
-    # Accumulate activations incrementally to reduce peak memory
-    activation_sum = None
+    if batch_probes and num_probes > 1:
+        # Batched processing: single forward pass for all probes
+        # Pad sequences to same length and batch them
+        max_len = max(t.shape[1] for t in probe_tokens)
+        device = probe_tokens[0].device
+        dtype = probe_tokens[0].dtype
 
-    for input_ids, attention_mask in zip(probe_tokens, probe_masks):
+        # Pad and stack all probes
+        batched_ids = []
+        batched_masks = []
+        for ids, mask in zip(probe_tokens, probe_masks):
+            pad_len = max_len - ids.shape[1]
+            if pad_len > 0:
+                # Pad on the right
+                ids = F.pad(ids, (0, pad_len), value=0)
+                mask = F.pad(mask, (0, pad_len), value=0)
+            batched_ids.append(ids)
+            batched_masks.append(mask)
+
+        # Stack into batch: (num_probes, seq_len)
+        all_ids = torch.cat(batched_ids, dim=0)
+        all_masks = torch.cat(batched_masks, dim=0)
+
+        # Single batched forward pass
         outputs = functional_lora.forward_with_lora(
             lora_weights=lora_weights,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
+            input_ids=all_ids,
+            attention_mask=all_masks,
             output_hidden_states=False,
             use_cache=False,
         )
@@ -309,20 +332,52 @@ def compute_delta_differentiable(
                 raise AttributeError("Model outputs missing `last_hidden_state` and `hidden_states`")
             hidden = hidden_states[-1]
 
-        seq_lens = attention_mask.long().sum(dim=1).clamp(min=1) - 1
+        # Extract last token for each probe (based on actual sequence length)
+        seq_lens = all_masks.long().sum(dim=1).clamp(min=1) - 1
         batch_idx = torch.arange(hidden.shape[0], device=hidden.device)
-        last_token_hidden = hidden[batch_idx, seq_lens, :].squeeze(0).float()
+        last_token_hiddens = hidden[batch_idx, seq_lens, :].float()  # (num_probes, hidden_size)
 
-        # Accumulate instead of storing all activations
-        if activation_sum is None:
-            activation_sum = last_token_hidden
-        else:
-            activation_sum = activation_sum + last_token_hidden
+        # Average across probes
+        lora_activation = last_token_hiddens.mean(dim=0)
 
-        # Free Python refs (autograd saved tensors still live until backward).
         del outputs, hidden
 
-    lora_activation = activation_sum / num_probes
+    else:
+        # Sequential processing (original behavior, lower memory)
+        activation_sum = None
+
+        for input_ids, attention_mask in zip(probe_tokens, probe_masks):
+            outputs = functional_lora.forward_with_lora(
+                lora_weights=lora_weights,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=False,
+                use_cache=False,
+            )
+
+            if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+                hidden = outputs.last_hidden_state
+            else:
+                hidden_states = getattr(outputs, "hidden_states", None)
+                if hidden_states is None:
+                    raise AttributeError("Model outputs missing `last_hidden_state` and `hidden_states`")
+                hidden = hidden_states[-1]
+
+            seq_lens = attention_mask.long().sum(dim=1).clamp(min=1) - 1
+            batch_idx = torch.arange(hidden.shape[0], device=hidden.device)
+            last_token_hidden = hidden[batch_idx, seq_lens, :].squeeze(0).float()
+
+            # Accumulate instead of storing all activations
+            if activation_sum is None:
+                activation_sum = last_token_hidden
+            else:
+                activation_sum = activation_sum + last_token_hidden
+
+            # Free Python refs (autograd saved tensors still live until backward).
+            del outputs, hidden
+
+        lora_activation = activation_sum / num_probes
+
     return lora_activation - base_activation.float().detach()
 
 
