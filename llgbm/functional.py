@@ -256,11 +256,10 @@ class FunctionalLoRA:
             kwargs = {"input_ids": input_ids}
             if attention_mask is not None:
                 kwargs["attention_mask"] = attention_mask
-            if self._forward_has_var_kwargs or "output_hidden_states" in self._forward_arg_names:
-                kwargs["output_hidden_states"] = output_hidden_states
-            if self._forward_has_var_kwargs or "use_cache" in self._forward_arg_names:
-                kwargs["use_cache"] = use_cache
-            return self.backbone(**kwargs)
+            kwargs["output_hidden_states"] = output_hidden_states
+            kwargs["use_cache"] = use_cache
+            # Use base_model (not backbone) to get logits from the LM head
+            return self.base_model(**kwargs)
         finally:
             self._active_lora_weights = None
 
