@@ -319,17 +319,14 @@ def compute_delta_differentiable(
             lora_weights=lora_weights,
             input_ids=all_ids,
             attention_mask=all_masks,
-            output_hidden_states=False,
+            output_hidden_states=True,  # Need hidden states to compute delta
             use_cache=False,
         )
 
-        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
-            hidden = outputs.last_hidden_state
-        else:
-            hidden_states = getattr(outputs, "hidden_states", None)
-            if hidden_states is None:
-                raise AttributeError("Model outputs missing `last_hidden_state` and `hidden_states`")
-            hidden = hidden_states[-1]
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is None:
+            raise AttributeError("Model outputs missing `hidden_states`. Ensure output_hidden_states=True.")
+        hidden = hidden_states[-1]
 
         # Extract last token for each probe (based on actual sequence length)
         seq_lens = all_masks.long().sum(dim=1).clamp(min=1) - 1
@@ -350,17 +347,14 @@ def compute_delta_differentiable(
                 lora_weights=lora_weights,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                output_hidden_states=False,
+                output_hidden_states=True,  # Need hidden states to compute delta
                 use_cache=False,
             )
 
-            if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
-                hidden = outputs.last_hidden_state
-            else:
-                hidden_states = getattr(outputs, "hidden_states", None)
-                if hidden_states is None:
-                    raise AttributeError("Model outputs missing `last_hidden_state` and `hidden_states`")
-                hidden = hidden_states[-1]
+            hidden_states = getattr(outputs, "hidden_states", None)
+            if hidden_states is None:
+                raise AttributeError("Model outputs missing `hidden_states`. Ensure output_hidden_states=True.")
+            hidden = hidden_states[-1]
 
             seq_lens = attention_mask.long().sum(dim=1).clamp(min=1) - 1
             batch_idx = torch.arange(hidden.shape[0], device=hidden.device)
@@ -401,17 +395,14 @@ def compute_delta_memory_efficient(
             lora_weights=lora_weights,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=False,
+            output_hidden_states=True,  # Need hidden states to compute delta
             use_cache=False,
         )
 
-        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
-            hidden = outputs.last_hidden_state
-        else:
-            hidden_states = getattr(outputs, "hidden_states", None)
-            if hidden_states is None:
-                raise AttributeError("Model outputs missing `last_hidden_state` and `hidden_states`")
-            hidden = hidden_states[-1]
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is None:
+            raise AttributeError("Model outputs missing `hidden_states`. Ensure output_hidden_states=True.")
+        hidden = hidden_states[-1]
 
         seq_lens = attention_mask.long().sum(dim=1).clamp(min=1) - 1
         batch_idx = torch.arange(hidden.shape[0], device=hidden.device)

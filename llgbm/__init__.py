@@ -10,6 +10,7 @@ from llgbm.delta import (
 from llgbm.dataset import (
     DeltaAugmentedDataset,
     Text2Qwen25LoRA_DeltaDataset,
+    RealAdapterDataset,
     create_dataloader,
 )
 from llgbm.functional import (
@@ -29,6 +30,31 @@ from llgbm.training import (
     train,
     evaluate,
 )
+from llgbm.generator import (
+    LoRAGenerator,
+    create_generator,
+)
+from llgbm.evaluation import (
+    format_chat_for_eval,
+    compute_eval_loss_with_lora,
+    compute_base_eval_loss,
+    evaluate_task_performance,
+    evaluate_teacher_adapter_loss,
+    # Accuracy-based evaluation
+    extract_mcq_answer,
+    extract_bool_answer,
+    extract_gsm8k_answer,
+    compute_accuracy_with_lora,
+    compute_teacher_accuracy,
+    compute_base_accuracy,
+    load_test_data,
+    evaluate_all_tasks,
+)
+from llgbm.ablations import (
+    AblationConfig,
+    run_ablations,
+    plot_ablation_results,
+)
 
 __version__ = "0.1.0"
 __all__ = [
@@ -44,6 +70,7 @@ __all__ = [
     # Datasets
     "DeltaAugmentedDataset",
     "Text2Qwen25LoRA_DeltaDataset",
+    "RealAdapterDataset",
     "create_dataloader",
     # Functional (differentiable)
     "FunctionalLoRA",
@@ -60,4 +87,26 @@ __all__ = [
     "train_step",
     "train",
     "evaluate",
+    # Generator
+    "LoRAGenerator",
+    "create_generator",
+    # Evaluation (loss-based)
+    "format_chat_for_eval",
+    "compute_eval_loss_with_lora",
+    "compute_base_eval_loss",
+    "evaluate_task_performance",
+    "evaluate_teacher_adapter_loss",
+    # Evaluation (accuracy-based)
+    "extract_mcq_answer",
+    "extract_bool_answer",
+    "extract_gsm8k_answer",
+    "compute_accuracy_with_lora",
+    "compute_teacher_accuracy",
+    "compute_base_accuracy",
+    "load_test_data",
+    "evaluate_all_tasks",
+    # Ablations
+    "AblationConfig",
+    "run_ablations",
+    "plot_ablation_results",
 ]

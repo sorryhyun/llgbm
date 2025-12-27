@@ -4,14 +4,14 @@ This module provides dataset classes that combine DnD's LoRA tokenization
 with delta activation supervision for behavioral matching.
 """
 
-import sys
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 
 import torch
 import numpy as np
 from torch.utils.data import Dataset
+from safetensors.torch import load_file
 
 from llgbm.delta import DeltaCache
 
@@ -339,3 +339,107 @@ def create_dataloader(
         collate_fn=dataset.collate_fn,
         pin_memory=True,
     )
+
+
+class RealAdapterDataset(Dataset):
+    """Dataset that loads real LoRA adapters and their task-specific deltas.
+
+    This dataset is used for ablation studies where we have pre-trained LoRA
+    adapters with cached delta activations.
+    """
+
+    def __init__(
+        self,
+        checkpoint_dir: str,
+        deltas_dir: str,
+        tokenizer,
+        config,
+    ):
+        """
+        Args:
+            checkpoint_dir: Directory containing adapter manifest and checkpoints
+            deltas_dir: Directory containing delta manifest and cached deltas
+            tokenizer: Text tokenizer for conditioning (e.g., bert-base-uncased)
+            config: TrainingConfig with model settings
+        """
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.deltas_dir = Path(deltas_dir)
+        self.tokenizer = tokenizer
+        self.config = config
+
+        manifest_path = self.checkpoint_dir / "manifest.json"
+        delta_manifest_path = self.deltas_dir / "delta_manifest.json"
+
+        self.samples = []
+        if manifest_path.exists() and delta_manifest_path.exists():
+            with open(manifest_path) as f:
+                self.adapter_manifest = json.load(f)
+            with open(delta_manifest_path) as f:
+                self.delta_manifest = json.load(f)
+
+            for adapter in self.adapter_manifest["adapters"]:
+                name = adapter["name"]
+                if name in self.delta_manifest["adapters"]:
+                    delta_info = self.delta_manifest["adapters"][name]
+                    self.samples.append({
+                        "name": name,
+                        "path": adapter["path"],
+                        "task": adapter.get("task", delta_info.get("task", "unknown")),
+                        "delta_file": delta_info["delta_file"],
+                        "probes_file": delta_info.get("probes_file", None),
+                    })
+        else:
+            self.adapter_manifest = {"adapters": []}
+            self.delta_manifest = {"adapters": {}}
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.samples[idx]
+
+        # Load task-specific probes for conditioning
+        probes_file = self.deltas_dir / sample["probes_file"] if sample["probes_file"] else None
+        if probes_file and Path(probes_file).exists():
+            with open(probes_file) as f:
+                probes_data = json.load(f)
+            text = probes_data["probes"][0] if probes_data["probes"] else sample["name"]
+        else:
+            prompts_file = Path(sample["path"]) / "prompts.json"
+            if prompts_file.exists():
+                with open(prompts_file) as f:
+                    prompts_data = json.load(f)
+                text = prompts_data["prompts"][0] if prompts_data["prompts"] else sample["name"]
+            else:
+                text = sample["name"]
+
+        enc = self.tokenizer(
+            text, max_length=256, padding="max_length", truncation=True, return_tensors="pt"
+        )
+
+        delta_path = self.deltas_dir / sample["delta_file"]
+        delta = np.load(delta_path)
+
+        adapter_weights_file = Path(sample["path"]) / "adapter_model.safetensors"
+        lora_weights = load_file(adapter_weights_file) if adapter_weights_file.exists() else {}
+
+        return {
+            "condition_ids": enc["input_ids"].squeeze(0),
+            "attention_mask": enc["attention_mask"].squeeze(0),
+            "delta_teacher": torch.from_numpy(delta).float(),
+            "adapter_name": sample["name"],
+            "task": sample["task"],
+            "lora_weights": lora_weights,
+        }
+
+    @staticmethod
+    def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
+        """Collate batch with mixed tensor and non-tensor fields."""
+        return {
+            "condition_ids": torch.stack([b["condition_ids"] for b in batch]),
+            "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
+            "delta_teacher": torch.stack([b["delta_teacher"] for b in batch]),
+            "adapter_names": [b["adapter_name"] for b in batch],
+            "tasks": [b["task"] for b in batch],
+            "lora_weights": [b["lora_weights"] for b in batch],
+        }
