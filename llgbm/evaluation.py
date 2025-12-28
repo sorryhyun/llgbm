@@ -477,6 +477,91 @@ def generate_with_lora(
     return generated
 
 
+def generate_with_lora_batched(
+    functional_lora: FunctionalLoRA,
+    lora_weights: Dict[str, torch.Tensor],
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    max_new_tokens: int = 64,
+    eos_token_ids: List[int] = None,
+    pad_token_id: int = 0,
+) -> torch.Tensor:
+    """
+    Batched generation using FunctionalLoRA with greedy sampling.
+
+    Handles right-padded inputs by taking logits at the last real token position
+    for each sequence.
+
+    Args:
+        functional_lora: FunctionalLoRA wrapper
+        lora_weights: Generated LoRA weights (dict mapping weight names to tensors)
+        input_ids: Input token IDs [B, seq_len]
+        attention_mask: Attention mask [B, seq_len]
+        max_new_tokens: Maximum tokens to generate
+        eos_token_ids: List of EOS token IDs
+        pad_token_id: Padding token ID
+
+    Returns:
+        Generated token IDs [B, seq_len + new_tokens]
+    """
+    if eos_token_ids is None:
+        eos_token_ids = [151643, 151645, 2]
+
+    batch_size = input_ids.shape[0]
+    device = input_ids.device
+
+    generated = input_ids.clone()
+    current_mask = attention_mask.clone()
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    # Track the position to sample from for each sequence
+    # Initially, this is the last real token position (for right-padded inputs)
+    seq_lengths = attention_mask.sum(dim=1).long()  # Length of real tokens per sample
+
+    for step in range(max_new_tokens):
+        if finished.all():
+            break
+
+        with torch.no_grad():
+            outputs = functional_lora.forward_with_lora(
+                lora_weights=lora_weights,
+                input_ids=generated,
+                attention_mask=current_mask,
+                output_hidden_states=False,
+                use_cache=False,
+            )
+
+        # For first step with right-padding, sample from last real token position
+        # After that, sample from the last position (where we appended tokens)
+        if step == 0:
+            # Get logits at the last real token position for each sample
+            batch_indices = torch.arange(batch_size, device=device)
+            last_real_pos = seq_lengths - 1  # 0-indexed position of last real token
+            next_logits = outputs.logits[batch_indices, last_real_pos, :]
+        else:
+            # After first step, new tokens are at the end
+            next_logits = outputs.logits[:, -1, :]
+
+        next_token = next_logits.argmax(dim=-1, keepdim=True)
+
+        # Replace with pad for finished sequences
+        next_token = torch.where(
+            finished.unsqueeze(1),
+            torch.full_like(next_token, pad_token_id),
+            next_token
+        )
+
+        # Append token
+        generated = torch.cat([generated, next_token], dim=1)
+        current_mask = torch.cat([current_mask, (~finished).long().unsqueeze(1)], dim=1)
+
+        # Check for EOS
+        for eos_id in eos_token_ids:
+            finished = finished | (next_token.squeeze(-1) == eos_id)
+
+    return generated
+
+
 def compute_accuracy_with_lora(
     generator: nn.Module,
     functional_lora: FunctionalLoRA,
@@ -587,6 +672,160 @@ def compute_accuracy_with_lora(
             iterator.set_postfix(acc=f"{correct/max(total,1):.2%}")
 
     accuracy = correct / max(total, 1)
+    return {
+        "accuracy": accuracy,
+        "correct": correct,
+        "total": total,
+        "parse_failures": parse_failures,
+    }
+
+
+def compute_accuracy_with_lora_batched(
+    generator: nn.Module,
+    functional_lora: FunctionalLoRA,
+    condition_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    eval_samples: List[Dict],
+    tokenizer,
+    task_type: Literal["mcq", "bool", "gsm8k"],
+    max_samples: int = 100,
+    max_new_tokens: int = 64,
+    batch_size: int = 8,
+    device: torch.device = None,
+    show_progress: bool = True,
+) -> Dict[str, float]:
+    """
+    Batched version: Generate LoRA weights and compute accuracy on test data.
+
+    Args:
+        generator: Trained LoRA generator
+        functional_lora: FunctionalLoRA wrapper for the base model
+        condition_ids: Condition input IDs for the generator
+        attention_mask: Attention mask for condition
+        eval_samples: List of eval examples with prompt/response
+        tokenizer: Tokenizer for the base model
+        task_type: Type of task ("mcq", "bool", "gsm8k")
+        max_samples: Maximum number of samples to evaluate
+        max_new_tokens: Maximum tokens to generate per sample
+        batch_size: Batch size for generation
+        device: Device for computation
+        show_progress: Show progress bar
+
+    Returns:
+        Dict with accuracy, correct count, total count, and parse failures
+    """
+    if device is None:
+        device = next(generator.parameters()).device
+
+    generator.eval()
+
+    # Ensure condition tensors are float-compatible for mask operations
+    condition_ids = condition_ids.long()
+    attention_mask = attention_mask.float()
+
+    # Generate LoRA weights
+    with torch.no_grad():
+        lora_weights_batch = generator(
+            condition_ids.unsqueeze(0).to(device),
+            attention_mask.unsqueeze(0).to(device)
+        )
+        lora_weights = lora_weights_batch[0]
+
+    # Debug: verify LoRA hook matching (only once)
+    if show_progress:
+        debug_info = functional_lora.debug_key_matching(lora_weights)
+        print(f"  [DEBUG] LoRA hooks: {debug_info['matched']}/{debug_info['total_hooks']} matched")
+        if debug_info['unmatched_count'] > 0:
+            print(f"    Sample LoRA keys: {debug_info['sample_lora_keys']}")
+            print(f"    Sample candidates: {debug_info['sample_candidates']}")
+            print(f"    Unmatched modules: {debug_info['unmatched_modules']}")
+
+    correct = 0
+    total = 0
+    parse_failures = 0
+
+    samples = eval_samples[:max_samples]
+    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+
+    # Process in batches
+    num_batches = (len(samples) + batch_size - 1) // batch_size
+    iterator = range(num_batches)
+    if show_progress:
+        iterator = tqdm(iterator, desc="Evaluating batches")
+
+    for batch_idx in iterator:
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, len(samples))
+        batch_samples = samples[start_idx:end_idx]
+
+        # Tokenize all prompts in batch
+        prompt_texts = [format_prompt_for_generation(s) for s in batch_samples]
+        inputs = tokenizer(
+            prompt_texts,
+            return_tensors="pt",
+            truncation=True,
+            max_length=384,
+            padding=True,
+        )
+        input_ids = inputs["input_ids"].to(device)
+        attn_mask = inputs["attention_mask"].to(device)
+        # Store the full padded input length for extracting new tokens later
+        input_length = input_ids.shape[1]
+
+        # Generate responses (batched)
+        generated_ids = generate_with_lora_batched(
+            functional_lora=functional_lora,
+            lora_weights=lora_weights,
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=pad_token_id,
+        )
+
+        # Process each sample in batch
+        for i, sample in enumerate(batch_samples):
+            # Extract only tokens generated after the full padded input
+            new_tokens = generated_ids[i, input_length:]
+            generated_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+            # Extract predicted answer
+            if task_type == "mcq":
+                pred = extract_mcq_answer(generated_text)
+            elif task_type == "bool":
+                pred = extract_bool_answer(generated_text)
+            else:
+                pred = extract_gsm8k_answer(generated_text)
+
+            gt = extract_ground_truth(sample, task_type)
+
+            # Debug: print first few samples to understand what's happening
+            if total < 3 and show_progress:
+                print(f"\n  [DEBUG] Sample {total}:")
+                print(f"    Generated: {generated_text[:200]!r}...")
+                print(f"    Pred: {pred}, GT: {gt}")
+                if "response" in sample:
+                    print(f"    GT response: {sample['response'][:100]!r}...")
+
+            if pred is None:
+                parse_failures += 1
+                total += 1
+                continue
+
+            if task_type == "gsm8k":
+                is_correct = gt is not None and abs(pred - gt) < 0.01
+            else:
+                is_correct = pred == gt
+
+            if is_correct:
+                correct += 1
+            total += 1
+
+        if show_progress:
+            iterator.set_postfix(acc=f"{correct/max(total,1):.2%}")
+
+    accuracy = correct / max(total, 1)
+    if show_progress and parse_failures > 0:
+        print(f"  [INFO] Parse failures: {parse_failures}/{total} ({100*parse_failures/max(total,1):.1f}%)")
     return {
         "accuracy": accuracy,
         "correct": correct,

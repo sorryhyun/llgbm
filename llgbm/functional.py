@@ -158,6 +158,31 @@ class FunctionalLoRA:
 
             self._hook_handles.append(module.register_forward_hook(_hook))
 
+    def debug_key_matching(self, lora_weights: Dict[str, torch.Tensor]) -> Dict[str, any]:
+        """Debug helper to check if LoRA weight keys match hook candidates."""
+        lora_keys = set(lora_weights.keys())
+        matched = 0
+        unmatched_modules = []
+
+        for module_name, candidates in self._module_key_candidates.items():
+            found = False
+            for a_key, b_key in candidates:
+                if a_key in lora_keys and b_key in lora_keys:
+                    found = True
+                    matched += 1
+                    break
+            if not found:
+                unmatched_modules.append(module_name)
+
+        return {
+            "total_hooks": len(self._module_key_candidates),
+            "matched": matched,
+            "unmatched_count": len(unmatched_modules),
+            "sample_lora_keys": list(lora_keys)[:5],
+            "sample_candidates": list(self._module_key_candidates.items())[:2],
+            "unmatched_modules": unmatched_modules[:5] if unmatched_modules else [],
+        }
+
     def apply_lora_weights(
         self,
         lora_weights: Dict[str, torch.Tensor],
