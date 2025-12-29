@@ -23,12 +23,18 @@ from llgbm.training import (
     TrainingState,
     MultiTaskLoss,
     DeltaOnlyLoss,
+    WeightLoss,
     compute_delta_for_batch,
     save_checkpoint,
     load_checkpoint,
     train_step,
     train,
     evaluate,
+)
+from llgbm.text_encoder import (
+    PretrainedTextEncoder,
+    EmbeddingCache,
+    create_text_encoder,
 )
 from llgbm.generator import (
     LoRAGenerator,
@@ -82,12 +88,17 @@ __all__ = [
     "TrainingState",
     "MultiTaskLoss",
     "DeltaOnlyLoss",
+    "WeightLoss",
     "compute_delta_for_batch",
     "save_checkpoint",
     "load_checkpoint",
     "train_step",
     "train",
     "evaluate",
+    # Text encoder
+    "PretrainedTextEncoder",
+    "EmbeddingCache",
+    "create_text_encoder",
     # Generator
     "LoRAGenerator",
     "create_generator",

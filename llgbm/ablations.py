@@ -21,10 +21,12 @@ from llgbm.probes import create_generic_probes
 from llgbm.functional import FunctionalLoRA
 from llgbm.dataset import RealAdapterDataset
 from llgbm.generator import create_generator
+from llgbm.text_encoder import create_text_encoder
 from llgbm.training import (
     TrainingConfig,
     MultiTaskLoss,
     DeltaOnlyLoss,
+    WeightLoss,
     train,
     evaluate,
 )
@@ -54,8 +56,14 @@ class AblationConfig:
     use_small_model: bool = True
     batch_size: int = 8
     gradient_accumulation_steps: int = 1
+    learning_rate: float = 2e-4
     warmup_steps: int = 50
     probes_per_task: int = 10
+
+    # Text encoder settings
+    text_encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    freeze_text_encoder: bool = True
+    num_prompts_per_adapter: int = 8
 
     # Colab support
     in_colab: bool = False
@@ -158,15 +166,33 @@ def setup_base_components(
     functional_lora = FunctionalLoRA(base_model, base_config.lora_rank, base_config.lora_alpha)
     print(f"[OK] Probes: {len(all_probes)}, FunctionalLoRA ready")
 
-    # Create dataset
-    text_tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-    dataset = RealAdapterDataset(checkpoint_dir, deltas_dir, text_tokenizer, base_config)
-    print(f"[OK] Dataset: {len(dataset)} samples")
+    # Create pretrained text encoder
+    print(f"[INFO] Loading text encoder: {config.text_encoder_name}")
+    text_encoder = create_text_encoder(
+        model_name=config.text_encoder_name,
+        freeze=config.freeze_text_encoder,
+        device=device,
+    )
+
+    # Create dataset with prompt batches
+    # Use text encoder's tokenizer for consistency
+    dataset = RealAdapterDataset(
+        checkpoint_dir=str(checkpoint_dir),
+        deltas_dir=str(deltas_dir),
+        tokenizer=text_encoder.tokenizer,
+        config=base_config,
+        num_prompts=config.num_prompts_per_adapter,
+    )
+    print(f"[OK] Dataset: {len(dataset)} samples, {config.num_prompts_per_adapter} prompts per adapter")
+
+    # Create weight loss criterion
+    weight_criterion = WeightLoss()
+    print("[OK] WeightLoss criterion ready")
 
     return {
         "base_model": base_model,
         "tokenizer": tokenizer,
-        "text_tokenizer": text_tokenizer,
+        "text_encoder": text_encoder,
         "functional_lora": functional_lora,
         "base_activation": base_activation,
         "probe_tokens": probe_tokens,
@@ -174,6 +200,7 @@ def setup_base_components(
         "dataset": dataset,
         "device": device,
         "torch_dtype": TORCH_DTYPE,
+        "weight_criterion": weight_criterion,
     }
 
 
@@ -202,22 +229,31 @@ def run_trial(
         use_small_model=base_config.use_small_model,
         batch_size=base_config.batch_size,
         gradient_accumulation_steps=base_config.gradient_accumulation_steps,
+        learning_rate=base_config.learning_rate,
         num_steps=num_steps,
-        warmup_steps=50,
+        warmup_steps=base_config.warmup_steps,
         lambda_weight=lambda_weight,
         lambda_delta=lambda_delta,
         output_dir=str(output_dir / f"{config_name}_trial{trial_idx}"),
     )
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
 
-    # Fresh generator
-    generator = create_generator(config, seed, device)
+    # Fresh generator with pretrained text encoder
+    generator = create_generator(
+        config,
+        seed,
+        device,
+        text_encoder=components["text_encoder"],
+    )
 
     # Loss function
     if lambda_weight == 0:
         criterion = DeltaOnlyLoss()
     else:
         criterion = MultiTaskLoss(lambda_weight=lambda_weight, lambda_delta=lambda_delta)
+
+    # Get weight criterion for direct weight supervision
+    weight_criterion = components.get("weight_criterion")
 
     # Optimizer & scheduler
     optimizer = AdamW(generator.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
@@ -255,6 +291,7 @@ def run_trial(
         scheduler=scheduler,
         config=config,
         compute_dtype=TORCH_DTYPE,
+        weight_criterion=weight_criterion,  # Pass weight criterion for direct weight supervision
     )
     train_time = time.time() - start_time
 
@@ -319,6 +356,7 @@ def run_ablations(config: AblationConfig) -> Dict[str, Any]:
         use_small_model=config.use_small_model,
         batch_size=config.batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
+        learning_rate=config.learning_rate,
         num_steps=config.num_steps,
         warmup_steps=config.warmup_steps,
     )

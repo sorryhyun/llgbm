@@ -6,7 +6,7 @@ and produce LoRA weights for target models.
 
 import torch
 import torch.nn as nn
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from llgbm.training import TrainingConfig
 
@@ -16,24 +16,39 @@ class LoRAGenerator(nn.Module):
     LoRA generator that produces adapter weights from text conditions.
 
     Takes text condition and generates LoRA weights (A and B matrices) for all
-    layers. Uses a transformer encoder to process condition, then projects to
-    LoRA weights via a hypernetwork-style decoder.
+    layers. Can use either:
+    1. A pretrained text encoder (recommended) for semantic embeddings
+    2. A learned embedding + transformer encoder (for backward compatibility)
     """
 
-    def __init__(self, cfg: TrainingConfig):
+    def __init__(
+        self,
+        cfg: TrainingConfig,
+        text_encoder: Optional[nn.Module] = None,
+    ):
         """
         Args:
             cfg: TrainingConfig with model architecture settings
+            text_encoder: Optional pretrained text encoder (e.g., PretrainedTextEncoder).
+                         If provided, uses pretrained embeddings. Otherwise, learns from scratch.
         """
         super().__init__()
         self.cfg = cfg
+        self.text_encoder = text_encoder
+        self.use_pretrained = text_encoder is not None
 
-        # Text encoder
-        self.embed = nn.Embedding(50000, 256)
-        self.encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=256, nhead=4, batch_first=True, dropout=0.1),
-            num_layers=3
-        )
+        # Determine input dimension based on encoder type
+        if self.use_pretrained:
+            # Get embed_dim from pretrained encoder
+            input_dim = getattr(text_encoder, "embed_dim", 384)
+        else:
+            # Use learned embeddings (backward compatibility)
+            self.embed = nn.Embedding(50000, 256)
+            self.encoder = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(d_model=256, nhead=4, batch_first=True, dropout=0.1),
+                num_layers=3
+            )
+            input_dim = 256
 
         # 7 projections per layer: q, k, v, o, gate, up, down
         self.num_projections = cfg.num_layers * 7
@@ -42,7 +57,7 @@ class LoRAGenerator(nn.Module):
         self.proj_embed_dim = 512
 
         # Generate projection embeddings from condition
-        self.proj_embeddings = nn.Linear(256, self.num_projections * self.proj_embed_dim)
+        self.proj_embeddings = nn.Linear(input_dim, self.num_projections * self.proj_embed_dim)
 
         self.lora_rank = cfg.lora_rank
 
@@ -101,28 +116,60 @@ class LoRAGenerator(nn.Module):
         Generate LoRA weights from text conditions.
 
         Args:
-            condition_ids: Input token IDs (B, seq_len)
-            attention_mask: Attention mask (B, seq_len)
+            condition_ids: Input token IDs (B, seq_len) or (B, N, seq_len) for batched prompts
+                          OR pre-computed embeddings (B, embed_dim) if attention_mask is None
+            attention_mask: Attention mask, same shape as condition_ids. If None and
+                           condition_ids is 2D with matching embed_dim, treats as embeddings.
 
         Returns:
             List of dicts mapping weight keys to tensors, one per batch item
         """
         B = condition_ids.shape[0]
 
-        # Encode condition
-        x = self.embed(condition_ids)
-        if attention_mask is not None:
-            key_padding_mask = ~attention_mask.bool()
-        else:
-            key_padding_mask = None
+        # Check if we received pre-computed embeddings
+        # (2D tensor with second dim matching embed_dim and no attention mask)
+        is_precomputed = (
+            len(condition_ids.shape) == 2
+            and attention_mask is None
+            and self.use_pretrained
+            and condition_ids.shape[1] == getattr(self.text_encoder, "embed_dim", -1)
+        )
 
-        x = self.encoder(x, src_key_padding_mask=key_padding_mask)
-
-        # Pool to single vector
-        if attention_mask is not None:
-            x = (x * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(1, keepdim=True).clamp(min=1)
+        if is_precomputed:
+            # Already have embeddings, use directly
+            x = condition_ids
+        elif self.use_pretrained:
+            # Use pretrained text encoder
+            # PretrainedTextEncoder handles (B, L) or (B, N, L) and returns (B, embed_dim)
+            x = self.text_encoder(condition_ids, attention_mask)
         else:
-            x = x.mean(1)
+            # Use learned embeddings (backward compatibility)
+            # Flatten batched prompts if needed
+            orig_B = B
+            if len(condition_ids.shape) == 3:
+                B, N, L = condition_ids.shape
+                condition_ids = condition_ids.view(B * N, L)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.view(B * N, L)
+
+            x = self.embed(condition_ids)
+            if attention_mask is not None:
+                key_padding_mask = ~attention_mask.bool()
+            else:
+                key_padding_mask = None
+
+            x = self.encoder(x, src_key_padding_mask=key_padding_mask)
+
+            # Pool to single vector
+            if attention_mask is not None:
+                x = (x * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(1, keepdim=True).clamp(min=1)
+            else:
+                x = x.mean(1)
+
+            # If we had batched prompts, pool across N dimension
+            if len(x.shape) == 2 and x.shape[0] != orig_B:
+                x = x.view(orig_B, -1, x.shape[-1]).mean(dim=1)  # (B, embed_dim)
+            B = orig_B
 
         # Generate per-projection embeddings: (B, num_proj, proj_embed_dim)
         proj_embeds = self.proj_embeddings(x).view(B, self.num_projections, self.proj_embed_dim)
@@ -161,6 +208,7 @@ def create_generator(
     cfg: TrainingConfig,
     seed: int = 42,
     device: torch.device = None,
+    text_encoder: Optional[nn.Module] = None,
 ) -> LoRAGenerator:
     """
     Create and initialize a LoRA generator.
@@ -169,6 +217,7 @@ def create_generator(
         cfg: Training configuration
         seed: Random seed for reproducibility
         device: Device to place model on
+        text_encoder: Optional pretrained text encoder for condition embeddings
 
     Returns:
         Initialized LoRAGenerator
@@ -177,7 +226,9 @@ def create_generator(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     torch.manual_seed(seed)
-    gen = LoRAGenerator(cfg).to(device)
+    gen = LoRAGenerator(cfg, text_encoder=text_encoder).to(device)
     num_params = sum(p.numel() for p in gen.parameters() if p.requires_grad)
     print(f"  Generator params: {num_params:,}")
+    if text_encoder is not None:
+        print(f"  Using pretrained text encoder: {getattr(text_encoder, 'model_name', 'unknown')}")
     return gen

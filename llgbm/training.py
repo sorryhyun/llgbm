@@ -8,7 +8,7 @@ import gc
 import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Tuple
 
 import torch
 import torch.nn as nn
@@ -17,6 +17,64 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from llgbm.functional import FunctionalLoRA, compute_delta_differentiable
+
+
+class WeightLoss(nn.Module):
+    """
+    Direct MSE loss between predicted and teacher LoRA weights.
+
+    This computes MSE between the generated LoRA A/B matrices and the
+    teacher adapter weights, without requiring tokenization.
+    """
+
+    def __init__(self, reduction: str = "mean"):
+        """
+        Args:
+            reduction: "mean" or "sum" for loss reduction
+        """
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(
+        self,
+        weights_pred: List[Dict[str, torch.Tensor]],
+        weights_teacher: List[Dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        """
+        Compute MSE between predicted and teacher LoRA weights.
+
+        Args:
+            weights_pred: List of weight dicts (one per batch item)
+            weights_teacher: List of teacher weight dicts (one per batch item)
+
+        Returns:
+            Scalar MSE loss
+        """
+        total_loss = 0.0
+        count = 0
+
+        for pred, teacher in zip(weights_pred, weights_teacher):
+            for key in pred.keys():
+                if key in teacher:
+                    pred_w = pred[key].float()
+                    teach_w = teacher[key].float().to(pred_w.device)
+
+                    # Only compute loss if shapes match
+                    if pred_w.shape == teach_w.shape:
+                        if self.reduction == "mean":
+                            total_loss += F.mse_loss(pred_w, teach_w, reduction="sum")
+                            count += pred_w.numel()
+                        else:
+                            total_loss += F.mse_loss(pred_w, teach_w, reduction="sum")
+                            count += 1
+
+        if count == 0:
+            # Return a tensor that requires grad for backward compatibility
+            return torch.tensor(0.0, requires_grad=True)
+
+        if self.reduction == "mean":
+            return total_loss / count
+        return total_loss
 
 
 @dataclass
@@ -36,7 +94,7 @@ class TrainingConfig:
     batch_size: int = 2
     num_workers: int = 4
     gradient_accumulation_steps: int = 4
-    learning_rate: float = 1e-4
+    learning_rate: float = 2e-4
     weight_decay: float = 0.01
     warmup_steps: int = 10
     num_steps: int = 500  # Total optimizer steps
@@ -64,6 +122,13 @@ class TrainingConfig:
     use_wandb: bool = False
     wandb_project: str = "llgbm"
     wandb_run_name: Optional[str] = None
+
+    # Text encoder settings
+    text_encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    freeze_text_encoder: bool = True
+    text_encoder_pooling: str = "mean"
+    num_prompts_per_adapter: int = 8
+    embedding_cache_dir: str = "embeddings"
 
     # Architecture (filled based on model choice)
     hidden_size: int = 896
@@ -243,7 +308,8 @@ def compute_delta_for_batch(
     condition_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     compute_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
+    return_weights: bool = False,
+) -> Tuple[torch.Tensor, Optional[List[Dict[str, torch.Tensor]]]]:
     """
     Compute delta activations for a batch of generated LoRAs.
 
@@ -253,12 +319,15 @@ def compute_delta_for_batch(
         base_activation: Pre-computed base model activation
         probe_tokens: Tokenized probe inputs
         probe_masks: Attention masks for probes
-        condition_ids: Condition token IDs (B, seq_len)
-        attention_mask: Condition attention mask (B, seq_len)
+        condition_ids: Condition token IDs (B, seq_len) or (B, N, seq_len) for batched prompts
+        attention_mask: Condition attention mask, same shape as condition_ids
         compute_dtype: Dtype for computation
+        return_weights: If True, also return the generated LoRA weights
 
     Returns:
-        Delta activations (B, hidden_size)
+        Tuple of:
+            - Delta activations (B, hidden_size)
+            - Generated LoRA weights (if return_weights=True), else None
     """
     batch_size = condition_ids.shape[0]
     device = condition_ids.device
@@ -279,7 +348,9 @@ def compute_delta_for_batch(
         )
         deltas.append(delta)
 
-    return torch.stack(deltas)
+    if return_weights:
+        return torch.stack(deltas), lora_weights_batch
+    return torch.stack(deltas), None
 
 
 def save_checkpoint(
@@ -338,28 +409,56 @@ def train_step(
     criterion: nn.Module,
     config: TrainingConfig,
     compute_dtype: torch.dtype,
+    weight_criterion: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """
     Single training step.
 
-    Returns dict of loss values (not scaled by accumulation).
+    Args:
+        batch: Batch dict with condition_ids, attention_mask, delta_teacher, lora_weights
+        generator: Generator model
+        functional_lora: FunctionalLoRA for delta computation
+        base_activation: Pre-computed base activation
+        probe_tokens: Tokenized probes
+        probe_masks: Probe attention masks
+        criterion: Loss function (MultiTaskLoss or DeltaOnlyLoss)
+        config: Training configuration
+        compute_dtype: Dtype for mixed precision
+        weight_criterion: Optional WeightLoss for direct weight supervision
+
+    Returns:
+        Dict of loss values (not scaled by accumulation).
     """
     device = next(generator.parameters()).device
 
     # Move batch to device
-    condition_ids = batch["condition_ids"].to(device)
-    attention_mask = batch["attention_mask"].to(device)
     delta_teacher = batch["delta_teacher"].to(device)
 
-    # Get teacher tokens if available
-    tokens_teacher = batch.get("tokens")
-    if tokens_teacher is not None:
-        tokens_teacher = tokens_teacher.to(device)
+    # Handle both cached embeddings and tokenized prompts
+    if "condition_embedding" in batch:
+        # Using cached embeddings - pass directly to generator
+        # Note: generator needs to handle this case
+        condition_ids = batch["condition_embedding"].to(device)
+        attention_mask = None
+    else:
+        condition_ids = batch["condition_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+
+    # Get teacher LoRA weights if available (for weight supervision)
+    lora_weights_teacher = batch.get("lora_weights")  # List[Dict[str, Tensor]]
 
     # Forward pass
     device_type = "cuda" if device.type == "cuda" else "cpu"
     with torch.autocast(device_type=device_type, dtype=compute_dtype):
-        delta_pred = compute_delta_for_batch(
+        # Compute delta and get generated weights
+        need_weights = (
+            weight_criterion is not None
+            and lora_weights_teacher is not None
+            and isinstance(criterion, MultiTaskLoss)
+            and config.lambda_weight > 0
+        )
+
+        delta_pred, lora_weights_pred = compute_delta_for_batch(
             generator=generator,
             functional_lora=functional_lora,
             base_activation=base_activation,
@@ -368,19 +467,30 @@ def train_step(
             condition_ids=condition_ids,
             attention_mask=attention_mask,
             compute_dtype=compute_dtype,
+            return_weights=need_weights,
         )
 
-        # Compute loss
-        if isinstance(criterion, MultiTaskLoss) and tokens_teacher is not None:
-            # Get predicted tokens if generator outputs them
-            tokens_pred = getattr(generator, "last_tokens", None)
+        # Compute delta loss
+        if isinstance(criterion, MultiTaskLoss):
+            # For MultiTaskLoss, compute delta loss via criterion
             losses = criterion(
                 delta_pred=delta_pred.float(),
                 delta_teacher=delta_teacher.float(),
-                tokens_pred=tokens_pred,
-                tokens_teacher=tokens_teacher.float() if tokens_teacher is not None else None,
+                tokens_pred=None,  # We no longer use token-based weight loss
+                tokens_teacher=None,
             )
+
+            # Compute weight loss separately if we have teacher weights
+            if need_weights and lora_weights_pred is not None:
+                loss_weight = weight_criterion(lora_weights_pred, lora_weights_teacher)
+                losses["loss_weight"] = loss_weight
+                # Recompute total loss with actual weight loss
+                losses["loss"] = (
+                    config.lambda_weight * loss_weight
+                    + config.lambda_delta * losses["loss_delta"]
+                )
         else:
+            # DeltaOnlyLoss or other
             losses = criterion(
                 delta_pred=delta_pred.float(),
                 delta_teacher=delta_teacher.float(),
@@ -390,7 +500,7 @@ def train_step(
     scaled_loss = losses["loss"] / config.gradient_accumulation_steps
     scaled_loss.backward()
 
-    return {k: v.item() for k, v in losses.items()}
+    return {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in losses.items()}
 
 
 def train(
@@ -407,6 +517,7 @@ def train(
     compute_dtype: torch.dtype = torch.bfloat16,
     callback: Optional[Callable[[TrainingState], None]] = None,
     num_steps: Optional[int] = None,
+    weight_criterion: Optional[nn.Module] = None,
 ) -> TrainingState:
     """
     Main training loop (step-based).
@@ -425,6 +536,7 @@ def train(
         compute_dtype: Dtype for mixed precision
         callback: Optional callback called after each update
         num_steps: Total optimizer steps. If None, uses num_epochs * len(dataloader) / grad_accum.
+        weight_criterion: Optional WeightLoss for direct weight supervision
 
     Returns:
         Final TrainingState
@@ -461,6 +573,7 @@ def train(
             criterion=criterion,
             config=config,
             compute_dtype=compute_dtype,
+            weight_criterion=weight_criterion,
         )
 
         running_loss += losses["loss"]
@@ -570,7 +683,7 @@ def evaluate(
 
         device_type = "cuda" if device.type == "cuda" else "cpu"
         with torch.autocast(device_type=device_type, dtype=compute_dtype):
-            delta_pred = compute_delta_for_batch(
+            delta_pred, _ = compute_delta_for_batch(
                 generator=generator,
                 functional_lora=functional_lora,
                 base_activation=base_activation,
@@ -578,6 +691,7 @@ def evaluate(
                 probe_masks=probe_masks,
                 condition_ids=condition_ids,
                 attention_mask=attention_mask,
+                return_weights=False,
             )
 
         losses = criterion(

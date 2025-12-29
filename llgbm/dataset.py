@@ -5,6 +5,7 @@ with delta activation supervision for behavioral matching.
 """
 
 import json
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -345,7 +346,9 @@ class RealAdapterDataset(Dataset):
     """Dataset that loads real LoRA adapters and their task-specific deltas.
 
     This dataset is used for ablation studies where we have pre-trained LoRA
-    adapters with cached delta activations.
+    adapters with cached delta activations. Now supports:
+    - Multiple prompts per adapter (prompt batches)
+    - Embedding caching for faster training
     """
 
     def __init__(
@@ -354,18 +357,27 @@ class RealAdapterDataset(Dataset):
         deltas_dir: str,
         tokenizer,
         config,
+        num_prompts: int = 8,
+        embedding_cache_dir: Optional[str] = None,
     ):
         """
         Args:
             checkpoint_dir: Directory containing adapter manifest and checkpoints
             deltas_dir: Directory containing delta manifest and cached deltas
-            tokenizer: Text tokenizer for conditioning (e.g., bert-base-uncased)
+            tokenizer: Text tokenizer for conditioning (e.g., bert-base-uncased or sentence-transformers)
             config: TrainingConfig with model settings
+            num_prompts: Number of prompts to sample per adapter (default: 8)
+            embedding_cache_dir: Optional directory for cached embeddings
         """
         self.checkpoint_dir = Path(checkpoint_dir)
         self.deltas_dir = Path(deltas_dir)
         self.tokenizer = tokenizer
         self.config = config
+        self.num_prompts = num_prompts
+        self.embedding_cache_dir = Path(embedding_cache_dir) if embedding_cache_dir else None
+
+        if self.embedding_cache_dir:
+            self.embedding_cache_dir.mkdir(parents=True, exist_ok=True)
 
         manifest_path = self.checkpoint_dir / "manifest.json"
         delta_manifest_path = self.deltas_dir / "delta_manifest.json"
@@ -395,51 +407,110 @@ class RealAdapterDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        sample = self.samples[idx]
+    def _load_prompts(self, sample: Dict) -> List[str]:
+        """Load all available prompts for an adapter."""
+        all_texts = []
 
-        # Load task-specific probes for conditioning
+        # Try probes file first
         probes_file = self.deltas_dir / sample["probes_file"] if sample["probes_file"] else None
         if probes_file and Path(probes_file).exists():
             with open(probes_file) as f:
                 probes_data = json.load(f)
-            text = probes_data["probes"][0] if probes_data["probes"] else sample["name"]
+            all_texts.extend(probes_data.get("probes", []))
+
+        # Then try prompts.json
+        prompts_file = Path(sample["path"]) / "prompts.json"
+        if prompts_file.exists():
+            with open(prompts_file) as f:
+                prompts_data = json.load(f)
+            all_texts.extend(prompts_data.get("prompts", []))
+
+        # Fallback to adapter name
+        if not all_texts:
+            all_texts = [sample["name"]]
+
+        return all_texts
+
+    def _sample_prompts(self, all_texts: List[str]) -> List[str]:
+        """Sample num_prompts texts from available prompts."""
+        if len(all_texts) >= self.num_prompts:
+            return random.sample(all_texts, self.num_prompts)
         else:
-            prompts_file = Path(sample["path"]) / "prompts.json"
-            if prompts_file.exists():
-                with open(prompts_file) as f:
-                    prompts_data = json.load(f)
-                text = prompts_data["prompts"][0] if prompts_data["prompts"] else sample["name"]
-            else:
-                text = sample["name"]
+            # Repeat texts if not enough
+            repeated = (all_texts * ((self.num_prompts // len(all_texts)) + 1))
+            return repeated[:self.num_prompts]
 
-        enc = self.tokenizer(
-            text, max_length=256, padding="max_length", truncation=True, return_tensors="pt"
-        )
+    def _get_cached_embedding(self, adapter_name: str) -> Optional[torch.Tensor]:
+        """Load cached embedding if available."""
+        if self.embedding_cache_dir is None:
+            return None
+        safe_name = adapter_name.replace("/", "_").replace("\\", "_")
+        cache_path = self.embedding_cache_dir / f"{safe_name}.npy"
+        if cache_path.exists():
+            return torch.from_numpy(np.load(cache_path))
+        return None
 
-        delta_path = self.deltas_dir / sample["delta_file"]
-        delta = np.load(delta_path)
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.samples[idx]
 
+        # Check for cached embedding first
+        cached_embedding = self._get_cached_embedding(sample["name"])
+
+        if cached_embedding is not None:
+            # Use cached embedding - no need for tokenization
+            result = {
+                "condition_embedding": cached_embedding.float(),
+                "delta_teacher": torch.from_numpy(np.load(self.deltas_dir / sample["delta_file"])).float(),
+                "adapter_name": sample["name"],
+                "task": sample["task"],
+            }
+        else:
+            # Load and sample prompts
+            all_texts = self._load_prompts(sample)
+            selected_texts = self._sample_prompts(all_texts)
+
+            # Tokenize batch of prompts
+            enc = self.tokenizer(
+                selected_texts,
+                max_length=256,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+
+            result = {
+                "condition_ids": enc["input_ids"],  # (N, seq_len) where N = num_prompts
+                "attention_mask": enc["attention_mask"],  # (N, seq_len)
+                "delta_teacher": torch.from_numpy(np.load(self.deltas_dir / sample["delta_file"])).float(),
+                "adapter_name": sample["name"],
+                "task": sample["task"],
+            }
+
+        # Load LoRA weights
         adapter_weights_file = Path(sample["path"]) / "adapter_model.safetensors"
-        lora_weights = load_file(adapter_weights_file) if adapter_weights_file.exists() else {}
+        result["lora_weights"] = load_file(adapter_weights_file) if adapter_weights_file.exists() else {}
 
-        return {
-            "condition_ids": enc["input_ids"].squeeze(0),
-            "attention_mask": enc["attention_mask"].squeeze(0),
-            "delta_teacher": torch.from_numpy(delta).float(),
-            "adapter_name": sample["name"],
-            "task": sample["task"],
-            "lora_weights": lora_weights,
-        }
+        return result
 
     @staticmethod
     def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
-        """Collate batch with mixed tensor and non-tensor fields."""
-        return {
-            "condition_ids": torch.stack([b["condition_ids"] for b in batch]),
-            "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
+        """Collate batch with mixed tensor and non-tensor fields.
+
+        Handles both cached embeddings and tokenized prompts.
+        """
+        result = {
             "delta_teacher": torch.stack([b["delta_teacher"] for b in batch]),
             "adapter_names": [b["adapter_name"] for b in batch],
             "tasks": [b["task"] for b in batch],
             "lora_weights": [b["lora_weights"] for b in batch],
         }
+
+        # Check if we have cached embeddings or tokenized prompts
+        if "condition_embedding" in batch[0]:
+            result["condition_embedding"] = torch.stack([b["condition_embedding"] for b in batch])
+        else:
+            # Stack tokenized prompts: (B, N, seq_len)
+            result["condition_ids"] = torch.stack([b["condition_ids"] for b in batch])
+            result["attention_mask"] = torch.stack([b["attention_mask"] for b in batch])
+
+        return result
