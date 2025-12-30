@@ -64,6 +64,7 @@ class AblationConfig:
     text_encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     freeze_text_encoder: bool = True
     num_prompts_per_adapter: int = 8
+    shuffle_task_prompts: bool = False  # Sample from task-wide prompt pool for generalization
 
     # Colab support
     in_colab: bool = False
@@ -182,8 +183,10 @@ def setup_base_components(
         tokenizer=text_encoder.tokenizer,
         config=base_config,
         num_prompts=config.num_prompts_per_adapter,
+        shuffle_task_prompts=config.shuffle_task_prompts,
     )
-    print(f"[OK] Dataset: {len(dataset)} samples, {config.num_prompts_per_adapter} prompts per adapter")
+    shuffle_mode = "task-shuffled" if config.shuffle_task_prompts else "adapter-specific"
+    print(f"[OK] Dataset: {len(dataset)} samples, {config.num_prompts_per_adapter} prompts per adapter ({shuffle_mode})")
 
     # Create weight loss criterion
     weight_criterion = WeightLoss()

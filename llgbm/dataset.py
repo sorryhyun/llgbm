@@ -359,6 +359,7 @@ class RealAdapterDataset(Dataset):
         config,
         num_prompts: int = 8,
         embedding_cache_dir: Optional[str] = None,
+        shuffle_task_prompts: bool = False,
     ):
         """
         Args:
@@ -368,6 +369,9 @@ class RealAdapterDataset(Dataset):
             config: TrainingConfig with model settings
             num_prompts: Number of prompts to sample per adapter (default: 8)
             embedding_cache_dir: Optional directory for cached embeddings
+            shuffle_task_prompts: If True, sample prompts from all adapters of the same task
+                                  instead of just the adapter's own prompts. This enforces
+                                  generalization by preventing prompt→weight memorization.
         """
         self.checkpoint_dir = Path(checkpoint_dir)
         self.deltas_dir = Path(deltas_dir)
@@ -375,6 +379,7 @@ class RealAdapterDataset(Dataset):
         self.config = config
         self.num_prompts = num_prompts
         self.embedding_cache_dir = Path(embedding_cache_dir) if embedding_cache_dir else None
+        self.shuffle_task_prompts = shuffle_task_prompts
 
         if self.embedding_cache_dir:
             self.embedding_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -403,6 +408,20 @@ class RealAdapterDataset(Dataset):
         else:
             self.adapter_manifest = {"adapters": []}
             self.delta_manifest = {"adapters": {}}
+
+        # Build per-task prompt pools for shuffle mode
+        self.task_prompt_pools: Dict[str, List[str]] = {}
+        if self.shuffle_task_prompts and self.samples:
+            for sample in self.samples:
+                task = sample["task"]
+                prompts = self._load_prompts(sample)
+                if task not in self.task_prompt_pools:
+                    self.task_prompt_pools[task] = []
+                self.task_prompt_pools[task].extend(prompts)
+
+            # Log pool sizes
+            for task, prompts in self.task_prompt_pools.items():
+                print(f"  Task '{task}' prompt pool: {len(prompts)} prompts")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -466,7 +485,13 @@ class RealAdapterDataset(Dataset):
             }
         else:
             # Load and sample prompts
-            all_texts = self._load_prompts(sample)
+            if self.shuffle_task_prompts:
+                # Sample from task-wide prompt pool for generalization
+                task = sample["task"]
+                all_texts = self.task_prompt_pools.get(task, [sample["name"]])
+            else:
+                # Use adapter's own prompts (original behavior)
+                all_texts = self._load_prompts(sample)
             selected_texts = self._sample_prompts(all_texts)
 
             # Tokenize batch of prompts
