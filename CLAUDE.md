@@ -23,6 +23,28 @@ uv pip install peft scikit-learn matplotlib seaborn
 
 Python 3.12+. Main dependencies: transformers 4.49.0, torch 2.5.1, peft, safetensors, accelerate.
 
+## Common Commands
+
+**Train teacher LoRA adapters:**
+```bash
+python train_lora_adapters.py \
+    --data_dir data \
+    --output_dir checkpoints \
+    --tasks arc_e boolq gsm8k \
+    --lora_rank 8
+```
+
+**Run DnD training (multi-GPU):**
+```bash
+./dnd_repo/scripts/launch_multi.sh workspace/main/tasks/math/train_qwen1.5lora_Math.py 4
+```
+
+**Task-specific DnD workflows:**
+```bash
+./dnd_repo/scripts/common_sense_reasoning/ARC-e/training_and_generation.sh
+./dnd_repo/scripts/math1.5B/training_and_generation.sh
+```
+
 ## Package Structure
 
 **`llgbm/`** - Core module with these submodules:
@@ -31,13 +53,33 @@ Python 3.12+. Main dependencies: transformers 4.49.0, torch 2.5.1, peft, safeten
 |--------|-------------|
 | `probes.py` | `create_generic_probes()`, `create_domain_probes(domain)` |
 | `delta.py` | `compute_base_activation()`, `compute_adapter_delta()`, `DeltaCache` |
-| `dataset.py` | `DeltaAugmentedDataset`, `Text2Qwen25LoRA_DeltaDataset`, `create_dataloader()` |
+| `dataset.py` | `DeltaAugmentedDataset`, `Text2Qwen25LoRA_DeltaDataset`, `RealAdapterDataset`, `create_dataloader()` |
 | `functional.py` | `FunctionalLoRA`, `compute_delta_differentiable()` |
 | `training.py` | `TrainingConfig`, `MultiTaskLoss`, `DeltaOnlyLoss`, `train()`, `evaluate()` |
+| `text_encoder.py` | `PretrainedTextEncoder`, `EmbeddingCache` |
+| `generator.py` | `LoRAGenerator`, `create_generator()` |
+| `evaluation.py` | `compute_accuracy_with_lora()`, `evaluate_all_tasks()` |
+| `ablations.py` | `AblationConfig`, `run_ablations()` |
 
 **`dnd_repo/`** - Submodule with base DnD framework:
 - `workspace/dnd/model/decoderonly.py`: HyperConv generator models
 - `workspace/dnd/tokenizer/register.py`: `Qwen2515LoRA_Tokenizer2D`
+
+## Architecture: Generator Pipeline
+
+```
+Text Prompts
+    ↓
+[text_encoder] → condition embeddings (384-dim)
+    ↓
+[generator] → LoRA weights (A, B matrices per layer)
+    ↓
+[functional] → Apply LoRA differentiably (hooks mode)
+    ↓
+[delta] → Compute Δ_pred via probe texts
+    ↓
+[training] → Loss = λ_w * L_weight + λ_d * L_delta
+```
 
 ## Notebooks
 
@@ -53,7 +95,7 @@ Python 3.12+. Main dependencies: transformers 4.49.0, torch 2.5.1, peft, safeten
 
 ## Key Abstractions
 
-**FunctionalLoRA**: Applies LoRA weights to base model without in-place modification, enabling gradient flow from delta loss back to generator. Uses `torch.func.functional_call`.
+**FunctionalLoRA**: Applies LoRA weights to base model without in-place modification, enabling gradient flow from delta loss back to generator. Uses hooks mode (default, memory-efficient) or `torch.func.functional_call` (legacy).
 
 **DeltaCache**: Persists embeddings to `deltas/` directory. Base activation computed once; per-adapter deltas stored as `.npy` files with manifest tracking.
 
@@ -80,8 +122,23 @@ Python 3.12+. Main dependencies: transformers 4.49.0, torch 2.5.1, peft, safeten
 
 **Gradient flow**: Phase 3+ uses `FunctionalLoRA.apply_lora_weights()` which returns effective params with gradient connection through the `delta = B @ A * scaling` computation.
 
-## DnD Training Scripts
+## Data Layout
 
-```bash
-./dnd_repo/scripts/launch_multi.sh workspace/main/tasks/math/train_qwen1.5lora_Math.py 4
+```
+checkpoints/
+├── {task}/              # arc_e, boolq, gsm8k
+│   └── {task}_{idx}/    # e.g., arc_e_000
+│       ├── adapter_model.safetensors
+│       └── prompts.json
+├── deltas/              # Cached delta embeddings
+│   ├── manifest.json
+│   ├── base_activation.npy
+│   └── {adapter_id}.npy
+└── manifest.json        # Central adapter index
+
+data/
+├── ARC-e_train.json
+├── BoolQ_train.json
+├── GSM8K_train.json
+└── HellaSwag_train.json
 ```

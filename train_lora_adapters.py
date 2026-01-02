@@ -9,6 +9,7 @@ Each adapter is saved with its training prompts for conditioning.
 import json
 import gc
 import argparse
+import random
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Dict, Optional
@@ -30,10 +31,10 @@ class TaskConfig:
 
 
 TASKS = {
-    "arc_e": TaskConfig("arc_e", "ARC-e_train.json", num_samples=400, num_adapters=3),
-    "boolq": TaskConfig("boolq", "BoolQ_train.json", num_samples=400, num_adapters=3),
-    "gsm8k": TaskConfig("gsm8k", "GSM8K_train.json", num_samples=300, num_adapters=3),
-    "hellaswag": TaskConfig("hellaswag", "HellaSwag_train.json", num_samples=400, num_adapters=2),
+    "arc_e": TaskConfig("arc_e", "ARC-e_train.json", num_samples=450, num_adapters=5),
+    "boolq": TaskConfig("boolq", "BoolQ_train.json", num_samples=1800, num_adapters=5),
+    "gsm8k": TaskConfig("gsm8k", "GSM8K_train.json", num_samples=1400, num_adapters=5),
+    "hellaswag": TaskConfig("hellaswag", "HellaSwag_train.json", num_samples=7900, num_adapters=5),
 }
 
 
@@ -197,6 +198,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4, help="Training batch size")
     parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--num_batches", type=int, default=5, help="Number of non-overlapping batches per task")
     args = parser.parse_args()
 
     # Setup
@@ -240,14 +242,19 @@ def main():
         print(f"Task: {task_name}")
         print(f"{'='*60}")
 
-        # Load task data
+        # Load task data and shuffle with fixed seed for reproducibility
         task_data = load_task_data(data_dir, task_config)
-        print(f"Loaded {len(task_data)} samples")
+        random.seed(args.seed)
+        random.shuffle(task_data)
+        print(f"Loaded {len(task_data)} samples (shuffled with seed={args.seed})")
+
+        # Determine number of batches for this task
+        num_batches = args.num_batches
 
         # Train multiple adapters with different data subsets
-        for adapter_idx in range(task_config.num_adapters):
+        for adapter_idx in range(num_batches):
             # Load fresh base model for each adapter
-            print(f"\nLoading base model for adapter {adapter_idx + 1}/{task_config.num_adapters}...")
+            print(f"\nLoading base model for adapter {adapter_idx + 1}/{num_batches}...")
             base_model = AutoModelForCausalLM.from_pretrained(
                 args.model_name,
                 torch_dtype=torch.bfloat16,
@@ -259,15 +266,20 @@ def main():
             model = get_peft_model(base_model, lora_config)
             model.print_trainable_parameters()
 
-            # Select data subset for this adapter
-            start_idx = adapter_idx * task_config.num_samples
-            end_idx = start_idx + task_config.num_samples
+            # Select data subset for this adapter (strict non-overlapping batches)
+            # Divide data into num_batches equal parts
+            total_samples = len(task_data)
+            samples_per_batch = total_samples // num_batches
 
-            # Wrap around if needed
-            if end_idx > len(task_data):
-                subset = task_data[start_idx:] + task_data[:end_idx - len(task_data)]
-            else:
-                subset = task_data[start_idx:end_idx]
+            start_idx = adapter_idx * samples_per_batch
+            end_idx = start_idx + samples_per_batch
+
+            # Last batch gets remaining samples
+            if adapter_idx == num_batches - 1:
+                end_idx = total_samples
+
+            subset = task_data[start_idx:end_idx]
+            print(f"  Batch {adapter_idx}: samples [{start_idx}:{end_idx}] ({len(subset)} samples)")
 
             adapter_name = f"{task_name}_{adapter_idx:03d}"
 
@@ -290,6 +302,8 @@ def main():
                 "path": str(output_dir / task_name / adapter_name),
                 "final_loss": loss,
                 "num_samples": len(subset),
+                "batch_idx": adapter_idx,
+                "batch_range": [start_idx, end_idx],
             })
 
             # Cleanup
@@ -304,6 +318,11 @@ def main():
         "lora_config": {
             "rank": args.lora_rank,
             "alpha": args.lora_alpha,
+        },
+        "training_config": {
+            "non_overlapping_batches": True,
+            "num_batches_per_task": args.num_batches,
+            "shuffle_seed": args.seed,
         },
         "adapters": all_adapters,
     }
