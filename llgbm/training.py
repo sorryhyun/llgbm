@@ -19,6 +19,16 @@ from tqdm.auto import tqdm
 from llgbm.functional import FunctionalLoRA, compute_delta_differentiable
 
 
+def _canonicalize_lora_key(key: str) -> str:
+    """Normalize LoRA state_dict keys across save formats (e.g., PEFT prefixes)."""
+    if key.startswith("base_model.model."):
+        # PEFT adapters often prefix keys with "base_model.model.".
+        return key[len("base_model.model.") :]
+    if key.startswith("base_model."):
+        return key[len("base_model.") :]
+    return key
+
+
 class WeightLoss(nn.Module):
     """
     Direct MSE loss between predicted and teacher LoRA weights.
@@ -34,6 +44,7 @@ class WeightLoss(nn.Module):
         """
         super().__init__()
         self.reduction = reduction
+        self.last_debug: Dict[str, Any] = {}
 
     def forward(
         self,
@@ -52,15 +63,32 @@ class WeightLoss(nn.Module):
         """
         total_loss = 0.0
         count = 0
+        matched_tensors = 0
+        matched_keys = 0
+        key_overlap = 0
+
+        pred_total_keys = 0
+        teacher_total_keys = 0
 
         for pred, teacher in zip(weights_pred, weights_teacher):
-            for key in pred.keys():
-                if key in teacher:
-                    pred_w = pred[key].float()
-                    teach_w = teacher[key].float().to(pred_w.device)
+            pred_canon = {_canonicalize_lora_key(k): v for k, v in pred.items()}
+            teacher_canon = {_canonicalize_lora_key(k): v for k, v in teacher.items()}
+
+            pred_keys = set(pred_canon.keys())
+            teacher_keys = set(teacher_canon.keys())
+            pred_total_keys += len(pred_keys)
+            teacher_total_keys += len(teacher_keys)
+            key_overlap += len(pred_keys & teacher_keys)
+
+            for key in pred_canon.keys():
+                if key in teacher_canon:
+                    matched_keys += 1
+                    pred_w = pred_canon[key].float()
+                    teach_w = teacher_canon[key].float().to(pred_w.device)
 
                     # Only compute loss if shapes match
                     if pred_w.shape == teach_w.shape:
+                        matched_tensors += 1
                         if self.reduction == "mean":
                             total_loss += F.mse_loss(pred_w, teach_w, reduction="sum")
                             count += pred_w.numel()
@@ -68,9 +96,22 @@ class WeightLoss(nn.Module):
                             total_loss += F.mse_loss(pred_w, teach_w, reduction="sum")
                             count += 1
 
+        # Store lightweight debug stats for sanity-checking weight supervision.
+        self.last_debug = {
+            "pred_total_keys": pred_total_keys,
+            "teacher_total_keys": teacher_total_keys,
+            "key_overlap": key_overlap,
+            "matched_keys": matched_keys,
+            "matched_tensors": matched_tensors,
+            "matched_numel": count if self.reduction == "mean" else None,
+        }
+
         if count == 0:
             # Return a tensor that requires grad for backward compatibility
-            return torch.tensor(0.0, requires_grad=True)
+            device = "cpu"
+            if weights_pred and weights_pred[0]:
+                device = next(iter(weights_pred[0].values())).device
+            return torch.zeros((), device=device, requires_grad=True)
 
         if self.reduction == "mean":
             return total_loss / count
@@ -484,6 +525,22 @@ def train_step(
             if need_weights and lora_weights_pred is not None:
                 loss_weight = weight_criterion(lora_weights_pred, lora_weights_teacher)
                 losses["loss_weight"] = loss_weight
+                # Surface key-matching stats for debugging (helpful when teacher keys have PEFT prefixes).
+                dbg = getattr(weight_criterion, "last_debug", None)
+                if isinstance(dbg, dict):
+                    losses["weight_key_overlap"] = float(dbg.get("key_overlap", 0))
+                    losses["weight_matched_tensors"] = float(dbg.get("matched_tensors", 0))
+
+                    if (
+                        not getattr(train_step, "_warned_no_weight_match", False)
+                        and float(dbg.get("matched_tensors", 0)) == 0
+                    ):
+                        print(
+                            "[WARN] Weight supervision matched 0 tensors. "
+                            "Teacher keys may be prefixed (e.g. 'base_model.model.'). "
+                            "Check WeightLoss.last_debug for details."
+                        )
+                        train_step._warned_no_weight_match = True
                 # Recompute total loss with actual weight loss
                 losses["loss"] = (
                     config.lambda_weight * loss_weight
