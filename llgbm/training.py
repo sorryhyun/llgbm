@@ -750,9 +750,14 @@ def evaluate(
     cosines = []
 
     for batch in tqdm(dataloader, desc="Evaluating"):
-        condition_ids = batch["condition_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
         delta_teacher = batch["delta_teacher"].to(device)
+
+        if "condition_embedding" in batch:
+            condition_ids = batch["condition_embedding"].to(device)
+            attention_mask = None
+        else:
+            condition_ids = batch["condition_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
 
         device_type = "cuda" if device.type == "cuda" else "cpu"
         with torch.autocast(device_type=device_type, dtype=compute_dtype):

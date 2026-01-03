@@ -32,6 +32,70 @@ from llgbm.training import (
 )
 
 
+def _precompute_embedding_cache(
+    dataset: RealAdapterDataset,
+    text_encoder,
+    cache_dir: Path,
+    *,
+    overwrite: bool = False,
+    max_length: int = 256,
+    variants: int = 1,
+    seed: int = 42,
+) -> None:
+    import numpy as np
+    import random
+    import hashlib
+    from tqdm.auto import tqdm
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    device = next(text_encoder.model.parameters()).device
+    variants = max(1, int(variants))
+
+    written = 0
+    skipped = 0
+    for sample in tqdm(dataset.samples, desc="Precomputing condition embeddings"):
+        adapter_name = sample["name"]
+        safe_name = adapter_name.replace("/", "_").replace("\\", "_")
+        cache_path = cache_dir / f"{safe_name}.npy"
+
+        if cache_path.exists() and not overwrite:
+            skipped += 1
+            continue
+
+        if dataset.shuffle_task_prompts:
+            all_texts = dataset.task_prompt_pools.get(sample["task"], [adapter_name])
+        else:
+            all_texts = dataset._load_prompts(sample)
+
+        # Stable per-adapter seed (avoid Python's randomized hash()).
+        adapter_seed_bytes = hashlib.sha256(adapter_name.encode("utf-8")).digest()[:8]
+        adapter_seed = int.from_bytes(adapter_seed_bytes, byteorder="little", signed=False)
+
+        pooled_variants = []
+        for v in range(variants):
+            rng = random.Random(adapter_seed + int(seed) + v)
+            if len(all_texts) >= dataset.num_prompts:
+                selected_texts = rng.sample(all_texts, dataset.num_prompts)
+            else:
+                repeated = (all_texts * ((dataset.num_prompts // max(1, len(all_texts))) + 1))
+                selected_texts = repeated[: dataset.num_prompts]
+
+            emb = text_encoder.encode_texts(selected_texts, max_length=max_length, device=device)
+            pooled = emb.mean(dim=0)
+            pooled_variants.append(pooled.detach().cpu())
+
+        pooled_stack = torch.stack(pooled_variants, dim=0)  # (V, embed_dim)
+        if variants == 1:
+            np.save(cache_path, pooled_stack[0].numpy())
+        else:
+            np.save(cache_path, pooled_stack.numpy())
+        written += 1
+
+    print(f"[OK] Embedding cache: wrote={written}, skipped={skipped}, dir={cache_dir}")
+    if torch.cuda.is_available() and device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 @dataclass
 class AblationConfig:
     """Configuration for ablation experiments."""
@@ -73,6 +137,15 @@ class AblationConfig:
     freeze_text_encoder: bool = True
     num_prompts_per_adapter: int = 8
     shuffle_task_prompts: bool = False  # Sample from task-wide prompt pool for generalization
+    # Cache condition embeddings per adapter to avoid repeated tokenization + text encoder forward.
+    # NOTE: if `shuffle_task_prompts=True`, caching makes conditioning deterministic per-adapter.
+    embedding_cache_dir: Optional[str] = None
+    precompute_embeddings: bool = False
+    overwrite_embedding_cache: bool = False
+    # If >1, precompute multiple pooled embeddings per adapter (different prompt subsets)
+    # and sample a variant each time the adapter is loaded.
+    embedding_cache_variants: int = 1
+    embedding_cache_seed: int = 42
 
     # Colab support
     in_colab: bool = False
@@ -209,16 +282,29 @@ def setup_base_components(
 
     # Create dataset with prompt batches
     # Use text encoder's tokenizer for consistency
+    if config.precompute_embeddings and not config.embedding_cache_dir:
+        config.embedding_cache_dir = str(Path(config.output_dir) / "embedding_cache")
     dataset = RealAdapterDataset(
         checkpoint_dir=str(checkpoint_dir),
         deltas_dir=str(deltas_dir),
         tokenizer=text_encoder.tokenizer,
         config=base_config,
         num_prompts=config.num_prompts_per_adapter,
+        embedding_cache_dir=config.embedding_cache_dir,
         shuffle_task_prompts=config.shuffle_task_prompts,
     )
     shuffle_mode = "task-shuffled" if config.shuffle_task_prompts else "adapter-specific"
     print(f"[OK] Dataset: {len(dataset)} samples, {config.num_prompts_per_adapter} prompts per adapter ({shuffle_mode})")
+
+    if config.precompute_embeddings and config.embedding_cache_dir:
+        _precompute_embedding_cache(
+            dataset=dataset,
+            text_encoder=text_encoder,
+            cache_dir=Path(config.embedding_cache_dir),
+            overwrite=config.overwrite_embedding_cache,
+            variants=config.embedding_cache_variants,
+            seed=config.embedding_cache_seed,
+        )
 
     # Create weight loss criterion
     weight_criterion = WeightLoss()

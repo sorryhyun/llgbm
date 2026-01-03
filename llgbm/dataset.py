@@ -466,7 +466,13 @@ class RealAdapterDataset(Dataset):
         safe_name = adapter_name.replace("/", "_").replace("\\", "_")
         cache_path = self.embedding_cache_dir / f"{safe_name}.npy"
         if cache_path.exists():
-            return torch.from_numpy(np.load(cache_path))
+            arr = np.load(cache_path)
+            # Support multi-variant caches saved as (V, embed_dim).
+            if arr.ndim == 2:
+                # Use torch RNG (DataLoader seeds workers deterministically) for reproducibility.
+                idx = int(torch.randint(0, arr.shape[0], (1,)).item())
+                arr = arr[idx]
+            return torch.from_numpy(arr)
         return None
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
