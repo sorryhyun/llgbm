@@ -68,7 +68,8 @@ class FunctionalLoRA:
         self._active_lora_weights: Optional[Dict[str, torch.Tensor]] = None
         self._hook_handles: List[torch.utils.hooks.RemovableHandle] = []
         self._module_key_candidates: Dict[str, Tuple[Tuple[str, str], ...]] = {}
-        self._forward_has_var_kwargs, self._forward_arg_names = self._inspect_forward(self.backbone)
+        self._base_forward_has_var_kwargs, self._base_forward_arg_names = self._inspect_forward(self.base_model)
+        self._backbone_forward_has_var_kwargs, self._backbone_forward_arg_names = self._inspect_forward(self.backbone)
 
         if self.mode == "hooks":
             self._register_lora_hooks()
@@ -84,6 +85,12 @@ class FunctionalLoRA:
             p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
         )
         return has_var_kwargs, set(sig.parameters.keys())
+
+    @staticmethod
+    def _filter_kwargs(kwargs: Dict[str, object], has_var_kwargs: bool, arg_names: set[str]) -> Dict[str, object]:
+        if has_var_kwargs:
+            return kwargs
+        return {k: v for k, v in kwargs.items() if k in arg_names}
 
     def close(self) -> None:
         """Remove registered hooks (useful in notebooks)."""
@@ -244,6 +251,7 @@ class FunctionalLoRA:
         attention_mask: Optional[torch.Tensor] = None,
         output_hidden_states: bool = False,
         use_cache: bool = False,
+        return_backbone: bool = False,
     ):
         """
         Run forward pass with LoRA weights applied functionally.
@@ -254,6 +262,8 @@ class FunctionalLoRA:
             attention_mask: Optional attention mask
             output_hidden_states: Whether to output hidden states
             use_cache: Whether to use KV cache (set False for training)
+            return_backbone: If True, run the model backbone (e.g. `model.model`) and return its outputs.
+                            This avoids LM head logits and can reduce VRAM.
 
         Returns:
             Model outputs
@@ -278,13 +288,19 @@ class FunctionalLoRA:
 
         self._active_lora_weights = lora_weights
         try:
-            kwargs = {"input_ids": input_ids}
+            kwargs: Dict[str, object] = {"input_ids": input_ids}
             if attention_mask is not None:
                 kwargs["attention_mask"] = attention_mask
             kwargs["output_hidden_states"] = output_hidden_states
             kwargs["use_cache"] = use_cache
-            # Use base_model (not backbone) to get logits from the LM head
-            return self.base_model(**kwargs)
+            target = self.backbone if return_backbone else self.base_model
+            if return_backbone:
+                kwargs = self._filter_kwargs(
+                    kwargs, self._backbone_forward_has_var_kwargs, self._backbone_forward_arg_names
+                )
+            else:
+                kwargs = self._filter_kwargs(kwargs, self._base_forward_has_var_kwargs, self._base_forward_arg_names)
+            return target(**kwargs)
         finally:
             self._active_lora_weights = None
 
@@ -344,14 +360,25 @@ def compute_delta_differentiable(
             lora_weights=lora_weights,
             input_ids=all_ids,
             attention_mask=all_masks,
-            output_hidden_states=True,  # Need hidden states to compute delta
+            output_hidden_states=False,
             use_cache=False,
+            return_backbone=True,
         )
-
-        hidden_states = getattr(outputs, "hidden_states", None)
-        if hidden_states is None:
-            raise AttributeError("Model outputs missing `hidden_states`. Ensure output_hidden_states=True.")
-        hidden = hidden_states[-1]
+        hidden = getattr(outputs, "last_hidden_state", None)
+        if hidden is None:
+            # Fallback for models/backends that only expose `hidden_states` (e.g. CausalLM wrapper).
+            outputs = functional_lora.forward_with_lora(
+                lora_weights=lora_weights,
+                input_ids=all_ids,
+                attention_mask=all_masks,
+                output_hidden_states=True,
+                use_cache=False,
+                return_backbone=False,
+            )
+            hidden_states = getattr(outputs, "hidden_states", None)
+            if hidden_states is None:
+                raise AttributeError("Model outputs missing `hidden_states`. Ensure output_hidden_states=True.")
+            hidden = hidden_states[-1]
 
         # Extract last token for each probe (based on actual sequence length)
         seq_lens = all_masks.long().sum(dim=1).clamp(min=1) - 1
@@ -372,14 +399,24 @@ def compute_delta_differentiable(
                 lora_weights=lora_weights,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                output_hidden_states=True,  # Need hidden states to compute delta
+                output_hidden_states=False,
                 use_cache=False,
+                return_backbone=True,
             )
-
-            hidden_states = getattr(outputs, "hidden_states", None)
-            if hidden_states is None:
-                raise AttributeError("Model outputs missing `hidden_states`. Ensure output_hidden_states=True.")
-            hidden = hidden_states[-1]
+            hidden = getattr(outputs, "last_hidden_state", None)
+            if hidden is None:
+                outputs = functional_lora.forward_with_lora(
+                    lora_weights=lora_weights,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    return_backbone=False,
+                )
+                hidden_states = getattr(outputs, "hidden_states", None)
+                if hidden_states is None:
+                    raise AttributeError("Model outputs missing `hidden_states`. Ensure output_hidden_states=True.")
+                hidden = hidden_states[-1]
 
             seq_lens = attention_mask.long().sum(dim=1).clamp(min=1) - 1
             batch_idx = torch.arange(hidden.shape[0], device=hidden.device)
@@ -420,19 +457,30 @@ def compute_delta_memory_efficient(
             lora_weights=lora_weights,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,  # Need hidden states to compute delta
+            output_hidden_states=False,
             use_cache=False,
+            return_backbone=True,
         )
-
-        hidden_states = getattr(outputs, "hidden_states", None)
-        if hidden_states is None:
-            raise AttributeError("Model outputs missing `hidden_states`. Ensure output_hidden_states=True.")
-        hidden = hidden_states[-1]
+        hidden = getattr(outputs, "last_hidden_state", None)
+        if hidden is None:
+            outputs = functional_lora.forward_with_lora(
+                lora_weights=lora_weights,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+                return_backbone=False,
+            )
+            hidden_states = getattr(outputs, "hidden_states", None)
+            if hidden_states is None:
+                raise AttributeError("Model outputs missing `hidden_states`. Ensure output_hidden_states=True.")
+            hidden = hidden_states[-1]
 
         seq_lens = attention_mask.long().sum(dim=1).clamp(min=1) - 1
         batch_idx = torch.arange(hidden.shape[0], device=hidden.device)
         last_hidden = hidden[batch_idx, seq_lens, :].squeeze(0).float()
         activation_sum = activation_sum + last_hidden
+        del outputs, hidden
 
     lora_activation = activation_sum / num_probes
     return lora_activation - base_activation.float().detach()

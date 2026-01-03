@@ -59,6 +59,14 @@ class AblationConfig:
     learning_rate: float = 2e-4
     warmup_steps: int = 50
     probes_per_task: int = 10
+    # Cap total probes used for delta computation (VRAM scales ~ linearly with this).
+    num_probes: int = 10
+    # Max length for probe tokenization (VRAM scales ~ linearly with this).
+    max_probe_length: int = 256
+    # If True, batch all probes into a single forward per adapter (faster, potentially higher peak VRAM).
+    delta_batch_probes: bool = True
+    # Enable HF gradient checkpointing on the base model (reduces VRAM, increases compute).
+    enable_gradient_checkpointing: bool = False
 
     # Text encoder settings
     text_encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2"
@@ -109,7 +117,15 @@ def setup_base_components(
         device_map=device,
         trust_remote_code=True
     )
-    base_model.config.output_hidden_states = True
+    base_model.config.output_hidden_states = False
+    base_model.config.use_cache = False
+    if config.enable_gradient_checkpointing and hasattr(base_model, "gradient_checkpointing_enable"):
+        base_model.gradient_checkpointing_enable()
+        # HF gradient checkpointing is typically gated on `model.training`.
+        base_model.train()
+        print("[OK] Gradient checkpointing enabled for base model")
+    else:
+        base_model.eval()
     for p in base_model.parameters():
         p.requires_grad = False
 
@@ -132,13 +148,17 @@ def setup_base_components(
         for adapter_name, adapter_info in delta_manifest["adapters"].items():
             task = adapter_info.get("task", "unknown")
             if task not in tasks_seen:
+                remaining = max(0, base_config.num_probes - len(all_probes))
+                if remaining == 0:
+                    break
                 adapter_path = adapter_paths.get(adapter_name)
                 if adapter_path:
                     prompts_file = Path(adapter_path) / "prompts.json"
                     if prompts_file.exists():
                         with open(prompts_file) as f:
                             prompts_data = json.load(f)
-                        probes = prompts_data.get("prompts", [])[:config.probes_per_task]
+                        per_task = min(config.probes_per_task, remaining)
+                        probes = prompts_data.get("prompts", [])[:per_task]
                         if probes:
                             all_probes.extend(probes)
                             tasks_seen.add(task)
@@ -147,6 +167,10 @@ def setup_base_components(
     if not all_probes:
         print("[WARN] No task-specific probes, using generic")
         all_probes = create_generic_probes()[:base_config.num_probes]
+    elif len(all_probes) > base_config.num_probes:
+        # Should be prevented by `remaining`, but keep as a safety net.
+        print(f"[INFO] Limiting probes: {len(all_probes)} -> {base_config.num_probes}")
+        all_probes = all_probes[:base_config.num_probes]
 
     # Tokenize probes
     probe_tokens, probe_masks = [], []
@@ -159,8 +183,16 @@ def setup_base_components(
     with torch.no_grad():
         base_acts = []
         for ids, mask in zip(probe_tokens, probe_masks):
-            out = base_model(input_ids=ids, attention_mask=mask, output_hidden_states=True)
-            h = out.hidden_states[-1][:, int(mask.sum()) - 1, :].squeeze(0)
+            backbone = getattr(base_model, "model", None)
+            if backbone is not None:
+                out = backbone(input_ids=ids, attention_mask=mask, use_cache=False)
+                hidden = out.last_hidden_state
+            else:
+                out = base_model(input_ids=ids, attention_mask=mask, output_hidden_states=True, use_cache=False)
+                hidden = out.hidden_states[-1]
+            seq_lens = mask.long().sum(dim=1).clamp(min=1) - 1
+            batch_idx = torch.arange(hidden.shape[0], device=hidden.device)
+            h = hidden[batch_idx, seq_lens, :].squeeze(0)
             base_acts.append(h)
         base_activation = torch.stack(base_acts).mean(dim=0)
 
@@ -237,6 +269,9 @@ def run_trial(
         warmup_steps=base_config.warmup_steps,
         lambda_weight=lambda_weight,
         lambda_delta=lambda_delta,
+        num_probes=base_config.num_probes,
+        max_probe_length=base_config.max_probe_length,
+        delta_batch_probes=base_config.delta_batch_probes,
         output_dir=str(output_dir / f"{config_name}_trial{trial_idx}"),
     )
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
@@ -362,6 +397,9 @@ def run_ablations(config: AblationConfig) -> Dict[str, Any]:
         learning_rate=config.learning_rate,
         num_steps=config.num_steps,
         warmup_steps=config.warmup_steps,
+        num_probes=config.num_probes,
+        max_probe_length=config.max_probe_length,
+        delta_batch_probes=config.delta_batch_probes,
     )
 
     print(f"Configurations: {list(config.configs.keys())}")

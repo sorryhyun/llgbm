@@ -152,6 +152,7 @@ class TrainingConfig:
     num_probes: int = 10
     max_probe_length: int = 256
     compute_delta_every_n_steps: int = 1
+    delta_batch_probes: bool = True
 
     # Paths
     checkpoint_dir: str = "data/teacher_checkpoints"
@@ -350,6 +351,7 @@ def compute_delta_for_batch(
     attention_mask: torch.Tensor,
     compute_dtype: torch.dtype = torch.bfloat16,
     return_weights: bool = False,
+    batch_probes: bool = True,
 ) -> Tuple[torch.Tensor, Optional[List[Dict[str, torch.Tensor]]]]:
     """
     Compute delta activations for a batch of generated LoRAs.
@@ -386,6 +388,7 @@ def compute_delta_for_batch(
             base_activation=base_activation,
             probe_tokens=probe_tokens,
             probe_masks=probe_masks,
+            batch_probes=batch_probes,
         )
         deltas.append(delta)
 
@@ -491,67 +494,80 @@ def train_step(
     # Forward pass
     device_type = "cuda" if device.type == "cuda" else "cpu"
     with torch.autocast(device_type=device_type, dtype=compute_dtype):
-        # Compute delta and get generated weights
-        need_weights = (
+        need_weight = (
             weight_criterion is not None
             and lora_weights_teacher is not None
-            and isinstance(criterion, MultiTaskLoss)
             and config.lambda_weight > 0
         )
 
-        delta_pred, lora_weights_pred = compute_delta_for_batch(
-            generator=generator,
-            functional_lora=functional_lora,
-            base_activation=base_activation,
-            probe_tokens=probe_tokens,
-            probe_masks=probe_masks,
-            condition_ids=condition_ids,
-            attention_mask=attention_mask,
-            compute_dtype=compute_dtype,
-            return_weights=need_weights,
-        )
-
-        # Compute delta loss
-        if isinstance(criterion, MultiTaskLoss):
-            # For MultiTaskLoss, compute delta loss via criterion
-            losses = criterion(
-                delta_pred=delta_pred.float(),
-                delta_teacher=delta_teacher.float(),
-                tokens_pred=None,  # We no longer use token-based weight loss
-                tokens_teacher=None,
+        # Weight-only path: skip delta forward entirely to save VRAM/compute.
+        if config.lambda_delta <= 0:
+            lora_weights_pred = generator(condition_ids, attention_mask)
+            loss_weight = (
+                weight_criterion(lora_weights_pred, lora_weights_teacher)
+                if need_weight
+                else torch.tensor(0.0, device=device)
             )
-
-            # Compute weight loss separately if we have teacher weights
-            if need_weights and lora_weights_pred is not None:
-                loss_weight = weight_criterion(lora_weights_pred, lora_weights_teacher)
-                losses["loss_weight"] = loss_weight
-                # Surface key-matching stats for debugging (helpful when teacher keys have PEFT prefixes).
-                dbg = getattr(weight_criterion, "last_debug", None)
-                if isinstance(dbg, dict):
-                    losses["weight_key_overlap"] = float(dbg.get("key_overlap", 0))
-                    losses["weight_matched_tensors"] = float(dbg.get("matched_tensors", 0))
-
-                    if (
-                        not getattr(train_step, "_warned_no_weight_match", False)
-                        and float(dbg.get("matched_tensors", 0)) == 0
-                    ):
-                        print(
-                            "[WARN] Weight supervision matched 0 tensors. "
-                            "Teacher keys may be prefixed (e.g. 'base_model.model.'). "
-                            "Check WeightLoss.last_debug for details."
-                        )
-                        train_step._warned_no_weight_match = True
-                # Recompute total loss with actual weight loss
-                losses["loss"] = (
-                    config.lambda_weight * loss_weight
-                    + config.lambda_delta * losses["loss_delta"]
-                )
+            losses = {
+                "loss_weight": loss_weight,
+                "loss_delta": torch.tensor(0.0, device=device),
+                "loss": config.lambda_weight * loss_weight,
+            }
         else:
-            # DeltaOnlyLoss or other
-            losses = criterion(
-                delta_pred=delta_pred.float(),
-                delta_teacher=delta_teacher.float(),
+            # Compute delta and (optionally) generated weights
+            delta_pred, lora_weights_pred = compute_delta_for_batch(
+                generator=generator,
+                functional_lora=functional_lora,
+                base_activation=base_activation,
+                probe_tokens=probe_tokens,
+                probe_masks=probe_masks,
+                condition_ids=condition_ids,
+                attention_mask=attention_mask,
+                compute_dtype=compute_dtype,
+                return_weights=need_weight and isinstance(criterion, MultiTaskLoss),
+                batch_probes=config.delta_batch_probes,
             )
+
+            # Compute delta loss
+            if isinstance(criterion, MultiTaskLoss):
+                losses = criterion(
+                    delta_pred=delta_pred.float(),
+                    delta_teacher=delta_teacher.float(),
+                    tokens_pred=None,  # We no longer use token-based weight loss
+                    tokens_teacher=None,
+                )
+
+                # Compute weight loss separately if we have teacher weights
+                if need_weight and lora_weights_pred is not None:
+                    loss_weight = weight_criterion(lora_weights_pred, lora_weights_teacher)
+                    losses["loss_weight"] = loss_weight
+                    # Surface key-matching stats for debugging (helpful when teacher keys have PEFT prefixes).
+                    dbg = getattr(weight_criterion, "last_debug", None)
+                    if isinstance(dbg, dict):
+                        losses["weight_key_overlap"] = float(dbg.get("key_overlap", 0))
+                        losses["weight_matched_tensors"] = float(dbg.get("matched_tensors", 0))
+
+                        if (
+                            not getattr(train_step, "_warned_no_weight_match", False)
+                            and float(dbg.get("matched_tensors", 0)) == 0
+                        ):
+                            print(
+                                "[WARN] Weight supervision matched 0 tensors. "
+                                "Teacher keys may be prefixed (e.g. 'base_model.model.'). "
+                                "Check WeightLoss.last_debug for details."
+                            )
+                            train_step._warned_no_weight_match = True
+                    # Recompute total loss with actual weight loss
+                    losses["loss"] = (
+                        config.lambda_weight * loss_weight
+                        + config.lambda_delta * losses["loss_delta"]
+                    )
+            else:
+                # DeltaOnlyLoss or other
+                losses = criterion(
+                    delta_pred=delta_pred.float(),
+                    delta_teacher=delta_teacher.float(),
+                )
 
     # Scale loss for gradient accumulation
     scaled_loss = losses["loss"] / config.gradient_accumulation_steps
@@ -749,6 +765,7 @@ def evaluate(
                 condition_ids=condition_ids,
                 attention_mask=attention_mask,
                 return_weights=False,
+                batch_probes=getattr(getattr(generator, "cfg", None), "delta_batch_probes", True),
             )
 
         losses = criterion(
