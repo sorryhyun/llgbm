@@ -341,6 +341,97 @@ class DeltaOnlyLoss(nn.Module):
         return {"loss": loss, "loss_delta": loss}
 
 
+class DeltaGuidedLoss(nn.Module):
+    """
+    Loss for training LoRA generator with delta prediction head.
+
+    Loss = λ_pred * L(δ_predicted, δ_teacher)
+         + λ_computed * L(δ_computed, δ_teacher)
+         + λ_consistency * L(δ_computed, δ_predicted)
+
+    Where:
+    - δ_predicted: Fast prediction from delta head (no LoRA application)
+    - δ_computed: Actual delta from applying generated LoRA weights
+    - δ_teacher: Target delta from teacher adapters
+    """
+
+    def __init__(
+        self,
+        lambda_pred: float = 1.0,
+        lambda_computed: float = 1.0,
+        lambda_consistency: float = 0.5,
+        normalize: bool = True,
+        loss_type: str = "mse",
+    ):
+        """
+        Args:
+            lambda_pred: Weight for predicted delta vs teacher loss
+            lambda_computed: Weight for computed delta vs teacher loss
+            lambda_consistency: Weight for consistency between predicted and computed
+            normalize: If True, normalize deltas before loss
+            loss_type: "mse" or "cosine"
+        """
+        super().__init__()
+        self.lambda_pred = lambda_pred
+        self.lambda_computed = lambda_computed
+        self.lambda_consistency = lambda_consistency
+        self.normalize = normalize
+        self.loss_type = loss_type
+
+    def _compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute loss between two delta tensors."""
+        if self.loss_type == "cosine":
+            cos_sim = F.cosine_similarity(pred, target, dim=-1)
+            return (1 - cos_sim).mean()
+        else:
+            if self.normalize:
+                pred = F.normalize(pred, dim=-1)
+                target = F.normalize(target, dim=-1)
+            return F.mse_loss(pred, target)
+
+    def forward(
+        self,
+        delta_predicted: torch.Tensor,
+        delta_computed: Optional[torch.Tensor],
+        delta_teacher: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute delta-guided loss.
+
+        Args:
+            delta_predicted: (B, hidden_size) from delta prediction head
+            delta_computed: (B, hidden_size) from applying LoRA, or None to skip
+            delta_teacher: (B, hidden_size) target from teacher adapters
+
+        Returns:
+            Dict with loss components
+        """
+        losses = {}
+
+        # Loss 1: Predicted delta vs teacher
+        loss_pred = self._compute_loss(delta_predicted, delta_teacher)
+        losses["loss_pred"] = loss_pred
+
+        total_loss = self.lambda_pred * loss_pred
+
+        # Loss 2: Computed delta vs teacher (if provided)
+        if delta_computed is not None and self.lambda_computed > 0:
+            loss_computed = self._compute_loss(delta_computed, delta_teacher)
+            losses["loss_computed"] = loss_computed
+            total_loss = total_loss + self.lambda_computed * loss_computed
+
+            # Loss 3: Consistency between predicted and computed
+            if self.lambda_consistency > 0:
+                loss_consistency = self._compute_loss(delta_computed, delta_predicted.detach())
+                losses["loss_consistency"] = loss_consistency
+                total_loss = total_loss + self.lambda_consistency * loss_consistency
+
+        losses["loss"] = total_loss
+        losses["loss_delta"] = total_loss  # For compatibility
+
+        return losses
+
+
 def compute_delta_for_batch(
     generator: nn.Module,
     functional_lora: FunctionalLoRA,
@@ -453,6 +544,7 @@ def train_step(
     criterion: nn.Module,
     config: TrainingConfig,
     compute_dtype: torch.dtype,
+    global_step: int = 0,
     weight_criterion: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """
@@ -500,8 +592,69 @@ def train_step(
             and config.lambda_weight > 0
         )
 
+        if isinstance(criterion, DeltaGuidedLoss):
+            # Delta-guided training:
+            # - always compute delta_predicted (cheap head)
+            # - compute delta_computed (expensive LoRA application) only every N steps
+            compute_every = max(1, int(getattr(config, "compute_delta_every_n_steps", 1)))
+            compute_delta_now = (global_step % compute_every) == 0
+            need_computed = compute_delta_now and (
+                float(getattr(criterion, "lambda_computed", 0.0)) > 0.0
+                or float(getattr(criterion, "lambda_consistency", 0.0)) > 0.0
+            )
+
+            # Only request LoRA weights when needed (computed delta and/or weight supervision).
+            return_lora = need_computed or need_weight
+            out = generator(
+                condition_ids,
+                attention_mask,
+                return_delta=True,
+                return_lora=return_lora,
+            )
+            delta_predicted = out["delta_pred"]
+
+            delta_computed = None
+            lora_weights_pred = out.get("lora_weights") if return_lora else None
+            if need_computed and lora_weights_pred is not None:
+                deltas = []
+                for i in range(condition_ids.shape[0]):
+                    delta_i = compute_delta_differentiable(
+                        functional_lora=functional_lora,
+                        lora_weights=lora_weights_pred[i],
+                        base_activation=base_activation,
+                        probe_tokens=probe_tokens,
+                        probe_masks=probe_masks,
+                        batch_probes=config.delta_batch_probes,
+                    )
+                    deltas.append(delta_i)
+                delta_computed = torch.stack(deltas, dim=0)
+
+            losses = criterion(
+                delta_predicted=delta_predicted.float(),
+                delta_computed=delta_computed.float() if delta_computed is not None else None,
+                delta_teacher=delta_teacher.float(),
+            )
+
+            # Optional direct weight supervision (does not require delta computation).
+            loss_weight = torch.tensor(0.0, device=device)
+            if need_weight:
+                if lora_weights_pred is None:
+                    # We didn't request LoRA weights above; generate them now.
+                    out_lora = generator(
+                        condition_ids,
+                        attention_mask,
+                        return_delta=False,
+                        return_lora=True,
+                    )
+                    lora_weights_pred = out_lora.get("lora_weights")
+                if lora_weights_pred is not None:
+                    loss_weight = weight_criterion(lora_weights_pred, lora_weights_teacher)
+                    losses["loss_weight"] = loss_weight
+                    losses["loss"] = losses["loss"] + config.lambda_weight * loss_weight
+            losses.setdefault("loss_weight", loss_weight)
+
         # Weight-only path: skip delta forward entirely to save VRAM/compute.
-        if config.lambda_delta <= 0:
+        elif config.lambda_delta <= 0:
             lora_weights_pred = generator(condition_ids, attention_mask)
             loss_weight = (
                 weight_criterion(lora_weights_pred, lora_weights_teacher)
@@ -646,6 +799,7 @@ def train(
             criterion=criterion,
             config=config,
             compute_dtype=compute_dtype,
+            global_step=state.step,
             weight_criterion=weight_criterion,
         )
 
@@ -746,8 +900,11 @@ def evaluate(
 
     total_loss = 0.0
     total_loss_delta = 0.0
+    total_loss_pred = 0.0
+    total_loss_computed = 0.0
     total_samples = 0
     cosines = []
+    cosines_pred = []
 
     for batch in tqdm(dataloader, desc="Evaluating"):
         delta_teacher = batch["delta_teacher"].to(device)
@@ -761,36 +918,74 @@ def evaluate(
 
         device_type = "cuda" if device.type == "cuda" else "cpu"
         with torch.autocast(device_type=device_type, dtype=compute_dtype):
-            delta_pred, _ = compute_delta_for_batch(
-                generator=generator,
-                functional_lora=functional_lora,
-                base_activation=base_activation,
-                probe_tokens=probe_tokens,
-                probe_masks=probe_masks,
-                condition_ids=condition_ids,
-                attention_mask=attention_mask,
-                return_weights=False,
-                batch_probes=getattr(getattr(generator, "cfg", None), "delta_batch_probes", True),
-            )
+            if isinstance(criterion, DeltaGuidedLoss):
+                out = generator(
+                    condition_ids,
+                    attention_mask,
+                    return_delta=True,
+                    return_lora=True,
+                )
+                delta_predicted = out["delta_pred"]
+                lora_weights_pred = out.get("lora_weights")
 
-        losses = criterion(
-            delta_pred=delta_pred.float(),
-            delta_teacher=delta_teacher.float(),
-        )
+                deltas = []
+                for i in range(condition_ids.shape[0]):
+                    delta_i = compute_delta_differentiable(
+                        functional_lora=functional_lora,
+                        lora_weights=lora_weights_pred[i],
+                        base_activation=base_activation,
+                        probe_tokens=probe_tokens,
+                        probe_masks=probe_masks,
+                        batch_probes=getattr(getattr(generator, "cfg", None), "delta_batch_probes", True),
+                    )
+                    deltas.append(delta_i)
+                delta_computed = torch.stack(deltas, dim=0)
+
+                losses = criterion(
+                    delta_predicted=delta_predicted.float(),
+                    delta_computed=delta_computed.float(),
+                    delta_teacher=delta_teacher.float(),
+                )
+
+                cos = F.cosine_similarity(delta_computed.float(), delta_teacher.float(), dim=-1)
+                cos_pred = F.cosine_similarity(delta_predicted.float(), delta_teacher.float(), dim=-1)
+            else:
+                delta_pred, _ = compute_delta_for_batch(
+                    generator=generator,
+                    functional_lora=functional_lora,
+                    base_activation=base_activation,
+                    probe_tokens=probe_tokens,
+                    probe_masks=probe_masks,
+                    condition_ids=condition_ids,
+                    attention_mask=attention_mask,
+                    return_weights=False,
+                    batch_probes=getattr(getattr(generator, "cfg", None), "delta_batch_probes", True),
+                )
+
+                losses = criterion(
+                    delta_pred=delta_pred.float(),
+                    delta_teacher=delta_teacher.float(),
+                )
+
+                cos = F.cosine_similarity(delta_pred.float(), delta_teacher.float(), dim=-1)
+                cos_pred = None
 
         batch_size = condition_ids.shape[0]
         total_loss += losses["loss"].item() * batch_size
         total_loss_delta += losses.get("loss_delta", losses["loss"]).item() * batch_size
+        total_loss_pred += float(losses.get("loss_pred", 0.0)) * batch_size
+        total_loss_computed += float(losses.get("loss_computed", 0.0)) * batch_size
         total_samples += batch_size
 
-        cos = F.cosine_similarity(delta_pred.float(), delta_teacher.float(), dim=-1)
         cosines.extend(cos.cpu().tolist())
+        if cos_pred is not None:
+            cosines_pred.extend(cos_pred.cpu().tolist())
 
     generator.train()
 
     import numpy as np
 
-    return {
+    result = {
         "eval_loss": total_loss / total_samples,
         "eval_loss_delta": total_loss_delta / total_samples,
         "mean_cosine": float(np.mean(cosines)),
@@ -798,3 +993,16 @@ def evaluate(
         "min_cosine": float(np.min(cosines)),
         "max_cosine": float(np.max(cosines)),
     }
+
+    # Extra metrics for delta-guided models.
+    if cosines_pred:
+        result.update(
+            {
+                "eval_loss_pred": total_loss_pred / total_samples,
+                "eval_loss_computed": total_loss_computed / total_samples,
+                "mean_cosine_pred": float(np.mean(cosines_pred)),
+                "std_cosine_pred": float(np.std(cosines_pred)),
+            }
+        )
+
+    return result

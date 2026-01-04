@@ -1,7 +1,8 @@
 """Ablation study runner for LLGBM.
 
 This module provides high-level functions to run ablation experiments
-comparing different training configurations (multi-task, delta-only, weight-only).
+comparing different training configurations (multi-task, delta-only, weight-only,
+delta-guided).
 """
 
 import gc
@@ -20,12 +21,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from llgbm.probes import create_generic_probes
 from llgbm.functional import FunctionalLoRA
 from llgbm.dataset import RealAdapterDataset
-from llgbm.generator import create_generator
+from llgbm.generator import create_generator, create_generator_with_delta_head
 from llgbm.text_encoder import create_text_encoder
 from llgbm.training import (
     TrainingConfig,
     MultiTaskLoss,
     DeltaOnlyLoss,
+    DeltaGuidedLoss,
     WeightLoss,
     train,
     evaluate,
@@ -101,7 +103,11 @@ class AblationConfig:
     """Configuration for ablation experiments."""
 
     # Experiment settings
-    configs: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
+    # Each config can specify:
+    # - mode: "multitask" | "delta_only" | "weight_only" | "delta_guided"
+    # - lambda_weight, lambda_delta (for multitask/weight/delta-only)
+    # - lambda_pred, lambda_computed, lambda_consistency, compute_delta_every_n_steps (for delta_guided)
+    configs: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
         "multitask": {"lambda_weight": 1.0, "lambda_delta": 0.1},
         "multitask2": {"lambda_weight": 0.5, "lambda_delta": 0.5},
         "delta_only": {"lambda_weight": 0.0, "lambda_delta": 1.0},
@@ -150,6 +156,48 @@ class AblationConfig:
     # Colab support
     in_colab: bool = False
     drive_output_dir: Optional[str] = None
+
+
+def _infer_mode(name: str, params: Dict[str, Any]) -> str:
+    mode = params.get("mode")
+    if isinstance(mode, str) and mode:
+        return mode
+
+    # Backward compatible inference based on (lambda_weight, lambda_delta).
+    lw = float(params.get("lambda_weight", 0.0))
+    ld = float(params.get("lambda_delta", 0.0))
+    if lw <= 0 and ld > 0:
+        return "delta_only"
+    if ld <= 0 and lw > 0:
+        return "weight_only"
+    if lw > 0 and ld > 0:
+        return "multitask"
+    raise ValueError(
+        f"Invalid ablation config '{name}': missing 'mode' and invalid "
+        f"(lambda_weight={lw}, lambda_delta={ld})."
+    )
+
+
+def phase4_6_configs(
+    *,
+    compute_delta_every_n_steps: int = 10,
+    lambda_pred: float = 1.0,
+    lambda_computed: float = 1.0,
+    lambda_consistency: float = 0.5,
+    delta_aggregation: str = "attention",
+) -> Dict[str, Dict[str, Any]]:
+    """Recommended Phase 4.6 comparison: delta-only vs delta-guided."""
+    return {
+        "delta_guided": {
+            "mode": "delta_guided",
+            "lambda_pred": float(lambda_pred),
+            "lambda_computed": float(lambda_computed),
+            "lambda_consistency": float(lambda_consistency),
+            "compute_delta_every_n_steps": int(compute_delta_every_n_steps),
+            "delta_aggregation": str(delta_aggregation),
+        },
+        "delta_only": {"mode": "delta_only", "lambda_weight": 0.0, "lambda_delta": 1.0},
+    }
 
 
 def setup_base_components(
@@ -327,8 +375,7 @@ def setup_base_components(
 
 def run_trial(
     config_name: str,
-    lambda_weight: float,
-    lambda_delta: float,
+    params: Dict[str, Any],
     seed: int,
     trial_idx: int,
     num_steps: int,
@@ -337,9 +384,26 @@ def run_trial(
     output_dir: Path,
 ) -> Dict[str, Any]:
     """Run a single ablation trial."""
+    mode = _infer_mode(config_name, params)
+    lambda_weight = float(params.get("lambda_weight", 0.0))
+    lambda_delta = float(params.get("lambda_delta", 1.0 if mode != "weight_only" else 0.0))
+    compute_delta_every = int(params.get("compute_delta_every_n_steps", base_config.compute_delta_every_n_steps))
+
     print(f"\n{'='*60}")
     print(f"Config: {config_name} | Trial {trial_idx+1} | Seed: {seed}")
-    print(f"lambda_w={lambda_weight}, lambda_d={lambda_delta}")
+    print(f"mode={mode}")
+    if mode == "delta_guided":
+        print(
+            "lambda_pred="
+            f"{float(params.get('lambda_pred', 1.0))}, "
+            "lambda_computed="
+            f"{float(params.get('lambda_computed', 1.0))}, "
+            "lambda_consistency="
+            f"{float(params.get('lambda_consistency', 0.5))}, "
+            f"compute_delta_every_n_steps={compute_delta_every}"
+        )
+    else:
+        print(f"lambda_w={lambda_weight}, lambda_d={lambda_delta}")
     print(f"{'='*60}")
 
     device = components["device"]
@@ -355,6 +419,7 @@ def run_trial(
         warmup_steps=base_config.warmup_steps,
         lambda_weight=lambda_weight,
         lambda_delta=lambda_delta,
+        compute_delta_every_n_steps=compute_delta_every,
         num_probes=base_config.num_probes,
         max_probe_length=base_config.max_probe_length,
         delta_batch_probes=base_config.delta_batch_probes,
@@ -363,15 +428,32 @@ def run_trial(
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
 
     # Fresh generator with pretrained text encoder
-    generator = create_generator(
-        config,
-        seed,
-        device,
-        text_encoder=components["text_encoder"],
-    )
+    if mode == "delta_guided":
+        generator = create_generator_with_delta_head(
+            config,
+            seed,
+            device,
+            text_encoder=components["text_encoder"],
+            delta_aggregation=str(params.get("delta_aggregation", "attention")),
+        )
+    else:
+        generator = create_generator(
+            config,
+            seed,
+            device,
+            text_encoder=components["text_encoder"],
+        )
 
     # Loss function
-    if lambda_weight == 0:
+    if mode == "delta_guided":
+        criterion = DeltaGuidedLoss(
+            lambda_pred=float(params.get("lambda_pred", 1.0)),
+            lambda_computed=float(params.get("lambda_computed", 1.0)),
+            lambda_consistency=float(params.get("lambda_consistency", 0.5)),
+            normalize=bool(params.get("normalize_delta", True)),
+            loss_type=str(params.get("loss_type", "mse")),
+        )
+    elif lambda_weight == 0:
         criterion = DeltaOnlyLoss()
     else:
         criterion = MultiTaskLoss(lambda_weight=lambda_weight, lambda_delta=lambda_delta)
@@ -444,16 +526,27 @@ def run_trial(
 
     result = {
         "config_name": config_name,
+        "mode": mode,
         "trial": trial_idx,
         "seed": seed,
         "lambda_weight": lambda_weight,
         "lambda_delta": lambda_delta,
+        "compute_delta_every_n_steps": compute_delta_every,
         "num_steps": num_steps,
         "final_loss": state.loss_history[-1] if state.loss_history else None,
         "best_loss": state.best_loss,
         "train_time": train_time,
         **eval_results,
     }
+    if mode == "delta_guided":
+        result.update(
+            {
+                "lambda_pred": float(params.get("lambda_pred", 1.0)),
+                "lambda_computed": float(params.get("lambda_computed", 1.0)),
+                "lambda_consistency": float(params.get("lambda_consistency", 0.5)),
+                "delta_aggregation": str(params.get("delta_aggregation", "attention")),
+            }
+        )
 
     cosine = result.get('mean_cosine', None)
     cosine_str = f"{cosine:.4f}" if cosine is not None else "N/A"
@@ -503,8 +596,7 @@ def run_ablations(config: AblationConfig) -> Dict[str, Any]:
             seed = config.seeds[trial_idx] if trial_idx < len(config.seeds) else 42 + trial_idx
             result = run_trial(
                 config_name=config_name,
-                lambda_weight=params["lambda_weight"],
-                lambda_delta=params["lambda_delta"],
+                params=params,
                 seed=seed,
                 trial_idx=trial_idx,
                 num_steps=config.num_steps,
@@ -528,6 +620,8 @@ def run_ablations(config: AblationConfig) -> Dict[str, Any]:
             "final_loss_std": float(c_df['final_loss'].std()),
             "mean_cosine_mean": float(c_df['mean_cosine'].mean()) if 'mean_cosine' in c_df.columns else None,
             "mean_cosine_std": float(c_df['mean_cosine'].std()) if 'mean_cosine' in c_df.columns else None,
+            "mean_cosine_pred_mean": float(c_df['mean_cosine_pred'].mean()) if 'mean_cosine_pred' in c_df.columns else None,
+            "mean_cosine_pred_std": float(c_df['mean_cosine_pred'].std()) if 'mean_cosine_pred' in c_df.columns else None,
         }
 
     # Save results

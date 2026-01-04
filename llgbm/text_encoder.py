@@ -165,6 +165,167 @@ class PretrainedTextEncoder(nn.Module):
         return torch.stack(embeddings)  # (B, embed_dim)
 
 
+class TrainableTextEncoder(nn.Module):
+    """Text encoder with trainable projection layer.
+
+    Keeps the pretrained encoder frozen but adds a learnable projection/adapter
+    on top, allowing gradients to flow back to the generator while preserving
+    pretrained semantic knowledge.
+
+    Architecture:
+        frozen_encoder -> projection -> LayerNorm -> output
+    """
+
+    def __init__(
+        self,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        output_dim: Optional[int] = None,
+        hidden_dim: int = 512,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        pooling: str = "mean",
+        device: Optional[torch.device] = None,
+    ):
+        """
+        Args:
+            model_name: HuggingFace model name for the base encoder
+            output_dim: Output embedding dimension. If None, uses input dim.
+            hidden_dim: Hidden dimension for projection MLP
+            num_layers: Number of projection layers (1 = linear, 2+ = MLP)
+            dropout: Dropout rate in projection
+            pooling: Pooling strategy - "mean", "cls", or "last"
+            device: Device to place the model on
+        """
+        super().__init__()
+
+        # Load frozen base encoder
+        self.base_model = AutoModel.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.pooling = pooling
+        self.model_name = model_name
+
+        # Freeze base model
+        for param in self.base_model.parameters():
+            param.requires_grad = False
+
+        # Get input dimension from base model
+        input_dim = self.base_model.config.hidden_size  # 384 for MiniLM-L6
+        self.base_embed_dim = input_dim
+
+        # Output dimension
+        if output_dim is None:
+            output_dim = input_dim
+        self.embed_dim = output_dim
+
+        # Build trainable projection
+        if num_layers == 1:
+            self.projection = nn.Sequential(
+                nn.Linear(input_dim, output_dim),
+                nn.LayerNorm(output_dim),
+            )
+        else:
+            layers = []
+            dims = [input_dim] + [hidden_dim] * (num_layers - 1) + [output_dim]
+            for i in range(len(dims) - 1):
+                layers.append(nn.Linear(dims[i], dims[i + 1]))
+                if i < len(dims) - 2:  # Not last layer
+                    layers.append(nn.GELU())
+                    layers.append(nn.Dropout(dropout))
+            layers.append(nn.LayerNorm(output_dim))
+            self.projection = nn.Sequential(*layers)
+
+        if device is not None:
+            self.base_model = self.base_model.to(device)
+            self.projection = self.projection.to(device)
+
+    def _pool_hidden(
+        self,
+        hidden: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pool hidden states according to strategy."""
+        if self.pooling == "cls":
+            return hidden[:, 0, :]
+        elif self.pooling == "last":
+            seq_lens = attention_mask.sum(dim=1).long() - 1
+            batch_idx = torch.arange(hidden.shape[0], device=hidden.device)
+            return hidden[batch_idx, seq_lens, :]
+        else:  # mean pooling
+            mask_expanded = attention_mask.unsqueeze(-1).float()
+            sum_hidden = (hidden * mask_expanded).sum(dim=1)
+            return sum_hidden / mask_expanded.sum(dim=1).clamp(min=1e-9)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute embeddings with trainable projection.
+
+        Args:
+            input_ids: (B, seq_len) or (B, N, seq_len) for batched prompts
+            attention_mask: same shape as input_ids
+
+        Returns:
+            embeddings: (B, embed_dim) with gradient connection
+        """
+        orig_shape = input_ids.shape
+
+        # Handle batched prompts (B, N, L) -> flatten to (B*N, L)
+        if len(orig_shape) == 3:
+            B, N, L = orig_shape
+            input_ids = input_ids.view(B * N, L)
+            attention_mask = attention_mask.view(B * N, L)
+        else:
+            B, L = orig_shape
+            N = 1
+
+        # Get frozen base embeddings (no grad through base model)
+        with torch.no_grad():
+            outputs = self.base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            hidden = outputs.last_hidden_state  # (B*N, L, hidden_size)
+
+        # Pool hidden states
+        pooled = self._pool_hidden(hidden, attention_mask)  # (B*N, base_embed_dim)
+
+        # Trainable projection (gradients flow here!)
+        projected = self.projection(pooled)  # (B*N, embed_dim)
+
+        # If we had batched prompts, pool across N dimension
+        if len(orig_shape) == 3:
+            projected = projected.view(B, N, -1)  # (B, N, embed_dim)
+            projected = projected.mean(dim=1)  # (B, embed_dim)
+
+        return projected
+
+    def encode_texts(
+        self,
+        texts: List[str],
+        max_length: int = 256,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """Encode raw text strings."""
+        if device is None:
+            device = next(self.base_model.parameters()).device
+
+        encoded = self.tokenizer(
+            texts,
+            max_length=max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        input_ids = encoded["input_ids"].to(device)
+        attention_mask = encoded["attention_mask"].to(device)
+
+        return self(input_ids, attention_mask)
+
+
 class EmbeddingCache:
     """Cache for precomputed text embeddings.
 
@@ -272,5 +433,56 @@ def create_text_encoder(
     print(f"  Total params: {num_params:,}")
     print(f"  Trainable: {trainable:,}")
     print(f"  Embed dim: {encoder.embed_dim}")
+
+    return encoder
+
+
+def create_trainable_text_encoder(
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    output_dim: Optional[int] = None,
+    hidden_dim: int = 512,
+    num_layers: int = 2,
+    dropout: float = 0.1,
+    device: Optional[torch.device] = None,
+) -> TrainableTextEncoder:
+    """
+    Create a text encoder with trainable projection layer.
+
+    The base encoder is frozen, but a projection layer on top is trainable,
+    allowing gradients to flow back during training.
+
+    Args:
+        model_name: HuggingFace model name for base encoder
+        output_dim: Output embedding dimension (default: same as input)
+        hidden_dim: Hidden dimension for projection MLP
+        num_layers: Number of projection layers (1=linear, 2+=MLP)
+        dropout: Dropout rate in projection
+        device: Device to place model on
+
+    Returns:
+        TrainableTextEncoder instance
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    encoder = TrainableTextEncoder(
+        model_name=model_name,
+        output_dim=output_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        dropout=dropout,
+        device=device,
+    )
+
+    # Count parameters
+    base_params = sum(p.numel() for p in encoder.base_model.parameters())
+    proj_params = sum(p.numel() for p in encoder.projection.parameters())
+    trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+
+    print(f"Trainable text encoder: {model_name}")
+    print(f"  Base encoder params: {base_params:,} (frozen)")
+    print(f"  Projection params: {proj_params:,} (trainable)")
+    print(f"  Total trainable: {trainable:,}")
+    print(f"  Input dim: {encoder.base_embed_dim} -> Output dim: {encoder.embed_dim}")
 
     return encoder

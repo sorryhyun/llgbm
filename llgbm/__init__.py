@@ -23,6 +23,7 @@ from llgbm.training import (
     TrainingState,
     MultiTaskLoss,
     DeltaOnlyLoss,
+    DeltaGuidedLoss,
     WeightLoss,
     compute_delta_for_batch,
     save_checkpoint,
@@ -33,12 +34,17 @@ from llgbm.training import (
 )
 from llgbm.text_encoder import (
     PretrainedTextEncoder,
+    TrainableTextEncoder,
     EmbeddingCache,
     create_text_encoder,
+    create_trainable_text_encoder,
 )
 from llgbm.generator import (
     LoRAGenerator,
+    DeltaPredictor,
+    LoRAGeneratorWithDeltaHead,
     create_generator,
+    create_generator_with_delta_head,
 )
 from llgbm.evaluation import (
     format_chat_for_eval,
@@ -59,6 +65,7 @@ from llgbm.evaluation import (
 )
 from llgbm.ablations import (
     AblationConfig,
+    phase4_6_configs,
     run_ablations,
     plot_ablation_results,
 )
@@ -88,6 +95,7 @@ __all__ = [
     "TrainingState",
     "MultiTaskLoss",
     "DeltaOnlyLoss",
+    "DeltaGuidedLoss",
     "WeightLoss",
     "compute_delta_for_batch",
     "save_checkpoint",
@@ -97,11 +105,16 @@ __all__ = [
     "evaluate",
     # Text encoder
     "PretrainedTextEncoder",
+    "TrainableTextEncoder",
     "EmbeddingCache",
     "create_text_encoder",
+    "create_trainable_text_encoder",
     # Generator
     "LoRAGenerator",
+    "DeltaPredictor",
+    "LoRAGeneratorWithDeltaHead",
     "create_generator",
+    "create_generator_with_delta_head",
     # Evaluation (loss-based)
     "format_chat_for_eval",
     "compute_eval_loss_with_lora",
@@ -120,6 +133,7 @@ __all__ = [
     "evaluate_all_tasks",
     # Ablations
     "AblationConfig",
+    "phase4_6_configs",
     "run_ablations",
     "plot_ablation_results",
 ]
