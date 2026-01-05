@@ -18,13 +18,15 @@ from llgbm.functional import (
     compute_delta_differentiable,
     compute_delta_memory_efficient,
 )
-from llgbm.training import (
-    TrainingConfig,
-    TrainingState,
+from llgbm.losses import (
+    WeightLoss,
     MultiTaskLoss,
     DeltaOnlyLoss,
     DeltaGuidedLoss,
-    WeightLoss,
+)
+from llgbm.training import (
+    TrainingConfig,
+    TrainingState,
     compute_delta_for_batch,
     save_checkpoint,
     load_checkpoint,

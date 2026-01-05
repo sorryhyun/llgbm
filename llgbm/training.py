@@ -17,105 +17,14 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from llgbm.functional import FunctionalLoRA, compute_delta_differentiable
+from llgbm.losses import (
+    WeightLoss,
+    MultiTaskLoss,
+    DeltaGuidedLoss,
+)
 
-
-def _canonicalize_lora_key(key: str) -> str:
-    """Normalize LoRA state_dict keys across save formats (e.g., PEFT prefixes)."""
-    if key.startswith("base_model.model."):
-        # PEFT adapters often prefix keys with "base_model.model.".
-        return key[len("base_model.model.") :]
-    if key.startswith("base_model."):
-        return key[len("base_model.") :]
-    return key
-
-
-class WeightLoss(nn.Module):
-    """
-    Direct MSE loss between predicted and teacher LoRA weights.
-
-    This computes MSE between the generated LoRA A/B matrices and the
-    teacher adapter weights, without requiring tokenization.
-    """
-
-    def __init__(self, reduction: str = "mean"):
-        """
-        Args:
-            reduction: "mean" or "sum" for loss reduction
-        """
-        super().__init__()
-        self.reduction = reduction
-        self.last_debug: Dict[str, Any] = {}
-
-    def forward(
-        self,
-        weights_pred: List[Dict[str, torch.Tensor]],
-        weights_teacher: List[Dict[str, torch.Tensor]],
-    ) -> torch.Tensor:
-        """
-        Compute MSE between predicted and teacher LoRA weights.
-
-        Args:
-            weights_pred: List of weight dicts (one per batch item)
-            weights_teacher: List of teacher weight dicts (one per batch item)
-
-        Returns:
-            Scalar MSE loss
-        """
-        total_loss = 0.0
-        count = 0
-        matched_tensors = 0
-        matched_keys = 0
-        key_overlap = 0
-
-        pred_total_keys = 0
-        teacher_total_keys = 0
-
-        for pred, teacher in zip(weights_pred, weights_teacher):
-            pred_canon = {_canonicalize_lora_key(k): v for k, v in pred.items()}
-            teacher_canon = {_canonicalize_lora_key(k): v for k, v in teacher.items()}
-
-            pred_keys = set(pred_canon.keys())
-            teacher_keys = set(teacher_canon.keys())
-            pred_total_keys += len(pred_keys)
-            teacher_total_keys += len(teacher_keys)
-            key_overlap += len(pred_keys & teacher_keys)
-
-            for key in pred_canon.keys():
-                if key in teacher_canon:
-                    matched_keys += 1
-                    pred_w = pred_canon[key].float()
-                    teach_w = teacher_canon[key].float().to(pred_w.device)
-
-                    # Only compute loss if shapes match
-                    if pred_w.shape == teach_w.shape:
-                        matched_tensors += 1
-                        if self.reduction == "mean":
-                            total_loss += F.mse_loss(pred_w, teach_w, reduction="sum")
-                            count += pred_w.numel()
-                        else:
-                            total_loss += F.mse_loss(pred_w, teach_w, reduction="sum")
-                            count += 1
-
-        # Store lightweight debug stats for sanity-checking weight supervision.
-        self.last_debug = {
-            "pred_total_keys": pred_total_keys,
-            "teacher_total_keys": teacher_total_keys,
-            "key_overlap": key_overlap,
-            "matched_keys": matched_keys,
-            "matched_tensors": matched_tensors,
-            "matched_numel": count if self.reduction == "mean" else None,
-        }
-
-        if count == 0:
-            # Return a tensor that requires grad for backward compatibility
-            device = "cpu"
-            if weights_pred and weights_pred[0]:
-                device = next(iter(weights_pred[0].values())).device
-            return torch.zeros((), device=device, requires_grad=True)
-
-        if self.reduction == "mean":
-            return total_loss / count
-        return total_loss
+# Re-export for backward compatibility
+__all__ = ["WeightLoss", "MultiTaskLoss", "DeltaGuidedLoss"]
 
 
 @dataclass
@@ -222,214 +131,6 @@ class TrainingState:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TrainingState":
         return cls(**data)
-
-
-class MultiTaskLoss(nn.Module):
-    """
-    Combined loss for multi-task training.
-
-    Loss = lambda_weight * L_weight + lambda_delta * L_delta
-
-    Where:
-    - L_weight: MSE between generated and teacher LoRA tokens
-    - L_delta: MSE between predicted and teacher delta activations
-    """
-
-    def __init__(
-        self,
-        lambda_weight: float = 1.0,
-        lambda_delta: float = 0.1,
-        normalize_delta: bool = True,
-    ):
-        """
-        Args:
-            lambda_weight: Weight for token/weight MSE loss
-            lambda_delta: Weight for delta MSE loss
-            normalize_delta: If True, normalize deltas before computing loss
-        """
-        super().__init__()
-        self.lambda_weight = lambda_weight
-        self.lambda_delta = lambda_delta
-        self.normalize_delta = normalize_delta
-
-    def forward(
-        self,
-        delta_pred: torch.Tensor,
-        delta_teacher: torch.Tensor,
-        tokens_pred: Optional[torch.Tensor] = None,
-        tokens_teacher: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute multi-task loss.
-
-        Args:
-            delta_pred: Predicted delta activations (B, hidden_size)
-            delta_teacher: Teacher delta activations (B, hidden_size)
-            tokens_pred: Predicted LoRA tokens (optional)
-            tokens_teacher: Teacher LoRA tokens (optional)
-
-        Returns:
-            Dict with 'loss', 'loss_weight', 'loss_delta'
-        """
-        losses = {}
-
-        # Delta loss
-        if self.normalize_delta:
-            delta_pred_norm = F.normalize(delta_pred, dim=-1)
-            delta_teacher_norm = F.normalize(delta_teacher, dim=-1)
-            loss_delta = F.mse_loss(delta_pred_norm, delta_teacher_norm)
-        else:
-            loss_delta = F.mse_loss(delta_pred, delta_teacher)
-
-        losses["loss_delta"] = loss_delta
-
-        # Weight loss (if provided)
-        if tokens_pred is not None and tokens_teacher is not None:
-            mask = ~torch.isnan(tokens_teacher)
-            if mask.any():
-                loss_weight = F.mse_loss(tokens_pred[mask], tokens_teacher[mask])
-            else:
-                loss_weight = torch.tensor(0.0, device=delta_pred.device)
-            losses["loss_weight"] = loss_weight
-        else:
-            loss_weight = torch.tensor(0.0, device=delta_pred.device)
-            losses["loss_weight"] = loss_weight
-
-        # Combined loss
-        total_loss = self.lambda_weight * loss_weight + self.lambda_delta * loss_delta
-        losses["loss"] = total_loss
-
-        return losses
-
-
-class DeltaOnlyLoss(nn.Module):
-    """
-    Delta-only loss for Phase 5 experiments.
-
-    Loss = L_delta(delta_pred, delta_teacher)
-
-    No weight supervision - purely behavioral matching.
-    """
-
-    def __init__(self, normalize: bool = True, loss_type: str = "mse"):
-        """
-        Args:
-            normalize: If True, normalize deltas before loss
-            loss_type: "mse" or "cosine"
-        """
-        super().__init__()
-        self.normalize = normalize
-        self.loss_type = loss_type
-
-    def forward(
-        self,
-        delta_pred: torch.Tensor,
-        delta_teacher: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """Compute delta-only loss."""
-        if self.loss_type == "cosine":
-            # Cosine similarity loss: 1 - cos_sim
-            cos_sim = F.cosine_similarity(delta_pred, delta_teacher, dim=-1)
-            loss = (1 - cos_sim).mean()
-        else:
-            # MSE loss
-            if self.normalize:
-                delta_pred = F.normalize(delta_pred, dim=-1)
-                delta_teacher = F.normalize(delta_teacher, dim=-1)
-            loss = F.mse_loss(delta_pred, delta_teacher)
-
-        return {"loss": loss, "loss_delta": loss}
-
-
-class DeltaGuidedLoss(nn.Module):
-    """
-    Loss for training LoRA generator with delta prediction head.
-
-    Loss = λ_pred * L(δ_predicted, δ_teacher)
-         + λ_computed * L(δ_computed, δ_teacher)
-         + λ_consistency * L(δ_computed, δ_predicted)
-
-    Where:
-    - δ_predicted: Fast prediction from delta head (no LoRA application)
-    - δ_computed: Actual delta from applying generated LoRA weights
-    - δ_teacher: Target delta from teacher adapters
-    """
-
-    def __init__(
-        self,
-        lambda_pred: float = 1.0,
-        lambda_computed: float = 1.0,
-        lambda_consistency: float = 0.5,
-        normalize: bool = True,
-        loss_type: str = "mse",
-    ):
-        """
-        Args:
-            lambda_pred: Weight for predicted delta vs teacher loss
-            lambda_computed: Weight for computed delta vs teacher loss
-            lambda_consistency: Weight for consistency between predicted and computed
-            normalize: If True, normalize deltas before loss
-            loss_type: "mse" or "cosine"
-        """
-        super().__init__()
-        self.lambda_pred = lambda_pred
-        self.lambda_computed = lambda_computed
-        self.lambda_consistency = lambda_consistency
-        self.normalize = normalize
-        self.loss_type = loss_type
-
-    def _compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute loss between two delta tensors."""
-        if self.loss_type == "cosine":
-            cos_sim = F.cosine_similarity(pred, target, dim=-1)
-            return (1 - cos_sim).mean()
-        else:
-            if self.normalize:
-                pred = F.normalize(pred, dim=-1)
-                target = F.normalize(target, dim=-1)
-            return F.mse_loss(pred, target)
-
-    def forward(
-        self,
-        delta_predicted: torch.Tensor,
-        delta_computed: Optional[torch.Tensor],
-        delta_teacher: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute delta-guided loss.
-
-        Args:
-            delta_predicted: (B, hidden_size) from delta prediction head
-            delta_computed: (B, hidden_size) from applying LoRA, or None to skip
-            delta_teacher: (B, hidden_size) target from teacher adapters
-
-        Returns:
-            Dict with loss components
-        """
-        losses = {}
-
-        # Loss 1: Predicted delta vs teacher
-        loss_pred = self._compute_loss(delta_predicted, delta_teacher)
-        losses["loss_pred"] = loss_pred
-
-        total_loss = self.lambda_pred * loss_pred
-
-        # Loss 2: Computed delta vs teacher (if provided)
-        if delta_computed is not None and self.lambda_computed > 0:
-            loss_computed = self._compute_loss(delta_computed, delta_teacher)
-            losses["loss_computed"] = loss_computed
-            total_loss = total_loss + self.lambda_computed * loss_computed
-
-            # Loss 3: Consistency between predicted and computed
-            if self.lambda_consistency > 0:
-                loss_consistency = self._compute_loss(delta_computed, delta_predicted.detach())
-                losses["loss_consistency"] = loss_consistency
-                total_loss = total_loss + self.lambda_consistency * loss_consistency
-
-        losses["loss"] = total_loss
-        losses["loss_delta"] = total_loss  # For compatibility
-
-        return losses
 
 
 def compute_delta_for_batch(
@@ -594,11 +295,10 @@ def train_step(
 
         if isinstance(criterion, DeltaGuidedLoss):
             # Delta-guided training:
-            # - always compute delta_predicted (cheap head)
-            # - compute delta_computed (expensive LoRA application) only every N steps
-            compute_every = max(1, int(getattr(config, "compute_delta_every_n_steps", 1)))
-            compute_delta_now = (global_step % compute_every) == 0
-            need_computed = compute_delta_now and (
+            # - Inner delta head steps are handled in train() before this function
+            # - This function always does the full forward (delta_pred + delta_computed)
+            # - delta_computed requires expensive LoRA application
+            need_computed = (
                 float(getattr(criterion, "lambda_computed", 0.0)) > 0.0
                 or float(getattr(criterion, "lambda_consistency", 0.0)) > 0.0
             )
@@ -729,6 +429,92 @@ def train_step(
     return {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in losses.items()}
 
 
+def _train_delta_head_inner_steps(
+    generator: nn.Module,
+    batch: Dict[str, torch.Tensor],
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    num_inner_steps: int,
+    compute_dtype: torch.dtype,
+    max_grad_norm: float = 1.0,
+) -> List[float]:
+    """
+    Train only the delta head for N inner steps (cheap, no LoRA application).
+
+    This is used in delta_guided mode to train the delta predictor more frequently
+    than the expensive LoRA computation.
+
+    Args:
+        generator: LoRAGeneratorWithDeltaHead model
+        batch: Batch with condition_ids, attention_mask, delta_teacher
+        criterion: DeltaGuidedLoss (only loss_pred is used)
+        optimizer: Optimizer for all parameters
+        num_inner_steps: Number of inner delta head updates
+        compute_dtype: Dtype for mixed precision
+        max_grad_norm: Gradient clipping threshold
+
+    Returns:
+        List of loss values for each inner step
+    """
+    device = next(generator.parameters()).device
+    delta_teacher = batch["delta_teacher"].to(device)
+
+    if "condition_embedding" in batch:
+        condition_ids = batch["condition_embedding"].to(device)
+        attention_mask = None
+    else:
+        condition_ids = batch["condition_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+
+    # Get delta head parameters to train
+    delta_head_params = set(generator.delta_head.parameters())
+    shared_proj_params = set(generator.shared_proj.parameters())
+    trainable_params = delta_head_params | shared_proj_params
+
+    # Freeze non-delta-head parameters temporarily
+    frozen_params = []
+    for p in generator.parameters():
+        if p not in trainable_params and p.requires_grad:
+            p.requires_grad = False
+            frozen_params.append(p)
+
+    inner_losses = []
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+
+    try:
+        for _ in range(num_inner_steps):
+            optimizer.zero_grad()
+
+            with torch.autocast(device_type=device_type, dtype=compute_dtype):
+                # Only compute delta_pred (cheap, no LoRA generation)
+                out = generator(
+                    condition_ids,
+                    attention_mask,
+                    return_delta=True,
+                    return_lora=False,
+                )
+                delta_predicted = out["delta_pred"]
+
+                # Compute only the prediction loss (no computed delta needed)
+                loss_pred = criterion._compute_loss(
+                    delta_predicted.float(),
+                    delta_teacher.float(),
+                )
+                loss = criterion.lambda_pred * loss_pred
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
+            optimizer.step()
+
+            inner_losses.append(loss.item())
+    finally:
+        # Restore frozen parameters
+        for p in frozen_params:
+            p.requires_grad = True
+
+    return inner_losses
+
+
 def train(
     generator: nn.Module,
     dataloader: DataLoader,
@@ -785,10 +571,27 @@ def train(
     running_loss_weight = 0.0
     update_count = 0
 
+    # Check if using delta-guided training with inner steps
+    is_delta_guided = isinstance(criterion, DeltaGuidedLoss)
+    inner_steps = max(0, config.compute_delta_every_n_steps - 1) if is_delta_guided else 0
+
     while update_count < num_steps:
         batch = next(data_iter)
 
-        # Training step
+        # For delta-guided mode: train delta head for N-1 inner steps first
+        # Then the main train_step will do the full forward (delta head + LoRA)
+        if inner_steps > 0:
+            _train_delta_head_inner_steps(
+                generator=generator,
+                batch=batch,
+                criterion=criterion,
+                optimizer=optimizer,
+                num_inner_steps=inner_steps,
+                compute_dtype=compute_dtype,
+                max_grad_norm=config.max_grad_norm,
+            )
+
+        # Training step (for delta-guided, this is the 1 full step with LoRA computation)
         losses = train_step(
             batch=batch,
             generator=generator,
