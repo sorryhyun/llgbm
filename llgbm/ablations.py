@@ -191,21 +191,21 @@ def phase4_6_configs(
 ) -> Dict[str, Dict[str, Any]]:
     """Phase 4.6 comparison: delta_guided vs multitask (delta_guided + weight) vs weight_only."""
     return {
-        "delta_guided": {
-            "mode": "delta_guided",
-            "lambda_pred": float(lambda_pred),
-            "lambda_computed": float(lambda_computed),
-            "lambda_consistency": float(lambda_consistency),
-            "lambda_weight": 0.0,  # No weight supervision
-            "compute_delta_every_n_steps": int(compute_delta_every_n_steps),
-            "delta_aggregation": str(delta_aggregation),
-        },
         "multitask": {
             "mode": "delta_guided",
             "lambda_pred": float(lambda_pred),
             "lambda_computed": float(lambda_computed),
             "lambda_consistency": float(lambda_consistency),
             "lambda_weight": float(lambda_weight),  # Add weight supervision
+            "compute_delta_every_n_steps": int(compute_delta_every_n_steps),
+            "delta_aggregation": str(delta_aggregation),
+        },
+        "delta_guided": {
+            "mode": "delta_guided",
+            "lambda_pred": float(lambda_pred),
+            "lambda_computed": float(lambda_computed),
+            "lambda_consistency": float(lambda_consistency),
+            "lambda_weight": 0.0,  # No weight supervision
             "compute_delta_every_n_steps": int(compute_delta_every_n_steps),
             "delta_aggregation": str(delta_aggregation),
         },

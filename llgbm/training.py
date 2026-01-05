@@ -653,8 +653,9 @@ def train(
 
             # Logging
             pbar.set_postfix({
-                "loss": f"{avg_loss:.4f}",
+                "L": f"{avg_loss:.4f}",
                 "L_d": f"{avg_loss_delta:.4f}",
+                "L_w": f"{avg_loss_weight:.4f}",
                 "lr": f"{scheduler.get_last_lr()[0]:.2e}",
             })
             pbar.update(1)
