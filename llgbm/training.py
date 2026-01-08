@@ -37,8 +37,8 @@ class TrainingConfig:
     dtype: str = "bfloat16"
 
     # LoRA settings
-    lora_rank: int = 8
-    lora_alpha: int = 16
+    lora_rank: int = 16
+    lora_alpha: int = 32
 
     # Training settings
     batch_size: int = 2
