@@ -16,6 +16,42 @@ v(M) = E[h^(L)_M(p, last_token)]  for p in P (probe texts)
 
 The generator learns to produce LoRA weights that induce the *same behavioral shift* as the teacher adapters, not just numerically similar weights.
 
+### Delta-Guided Training (Key Contribution)
+
+Computing deltas requires expensive forward passes through the base model with probes. **Delta-guided training** solves this with a two-stage approach:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Delta-Guided Architecture                                  │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Text Prompt ──► [Text Encoder] ──► condition               │
+│                                         │                   │
+│                                         ▼                   │
+│                                  [LoRA Generator]           │
+│                                    │         │              │
+│                                    ▼         ▼              │
+│                              LoRA weights   [Delta Head]    │
+│                                    │              │         │
+│                                    ▼              ▼         │
+│                           (every N steps)    δ_predicted    │
+│                                    │              │         │
+│                                    ▼              │         │
+│                              δ_computed ◄────────┘         │
+│                                                             │
+│  Loss = λ_pred * MSE(δ_pred, δ_teacher)                    │
+│       + λ_computed * MSE(δ_computed, δ_teacher)  [every N] │
+│       + λ_consistency * MSE(δ_pred, δ_computed)  [every N] │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Why it works:**
+1. **Delta Head** (cheap): Small MLP that predicts deltas from LoRA tokens — trained every step
+2. **Computed Delta** (expensive): Actual forward pass through base model — computed every N steps
+3. **Consistency Loss**: Keeps the delta head grounded to real behavior
+
+This reduces base model forward passes by ~N× while maintaining behavioral grounding.
+
 ---
 
 ## Key Results
@@ -25,7 +61,7 @@ The generator learns to produce LoRA weights that induce the *same behavioral sh
 | DnD framework reproduced on Qwen2.5 | ✅ Phase 0 |
 | Delta supervision is differentiable | ✅ Phase 3 |
 | Multi-task training (weights + deltas) | ✅ Phase 4 |
-| Ablation studies (3 trials × 2 configs) | ✅ Phase 4.5 |
+| Delta-guided vs delta-only ablation | ✅ Phase 4.5 |
 | Delta-only training validated | ✅ Phase 5 |
 
 ### Validated Findings
@@ -33,7 +69,8 @@ The generator learns to produce LoRA weights that induce the *same behavioral sh
 - **Tokenizer roundtrip error < 1e-3**: DnD's tokenize→detokenize maintains LoRA weight fidelity
 - **Delta norms ~0.1**: Reasonable scale for supervision signals; deltas cluster by domain in t-SNE
 - **100% gradient flow**: All LoRA tensors receive gradients through FunctionalLoRA hooks
-- **Loss convergence**: Multi-task training successfully balances weight and delta objectives
+- **Delta-guided efficiency**: Reduces expensive base model forward passes by N× while maintaining behavioral grounding
+- **Loss convergence**: Both delta-only and delta-guided approaches successfully train the generator
 
 ---
 
@@ -73,8 +110,8 @@ Instead of modifying model weights in-place, `FunctionalLoRA` applies LoRA weigh
 | 2 | `phase_2_dataset.ipynb` | Dataset returns `(tokens, condition, delta)` tuples | 100% batch iteration success |
 | 3 | `phase_3_differentiable.ipynb` | FunctionalLoRA with gradient flow | All LoRA tensors get gradients |
 | 4 | `phase_4_multitask.ipynb` | Multi-task training (weights + deltas) | Loss converges |
-| 4.5 | `phase_4_5_ablations.ipynb` | Delta-only vs delta-guided comparison | 3 trials × 2 configs |
-| 5 | `phase_5_delta_only.ipynb` | Behavioral supervision only (no weight MSE) | Validates delta-only approach |
+| 4.5 | `phase_4_5_ablations.ipynb` | **Delta-guided**: delta head + periodic grounding | N× fewer base model forwards |
+| 5 | `phase_5_delta_only.ipynb` | Pure behavioral supervision (no weight MSE) | Validates approach |
 
 ---
 
@@ -144,13 +181,24 @@ LoRA targets: `q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj`
 ### Multi-task Loss (Phase 4)
 ```python
 L = lambda_weight * MSE(tokens_pred, tokens_teacher)
-  + lambda_delta * MSE(delta_pred, delta_teacher)
+  + lambda_delta * MSE(delta_computed, delta_teacher)
 ```
 
-### Delta-only Loss (Phase 5)
+### Delta-Only (Phase 4.5)
+Compute actual delta every step — accurate but expensive:
 ```python
-L = MSE(delta_pred, delta_teacher) + regularization
+L = MSE(delta_computed, delta_teacher)
 ```
+
+### Delta-Guided (Phase 4.5) — Recommended
+Train delta head every step, compute actual delta every N steps:
+```python
+L = lambda_pred * MSE(delta_predicted, delta_teacher)           # every step
+  + lambda_computed * MSE(delta_computed, delta_teacher)        # every N steps
+  + lambda_consistency * MSE(delta_predicted, delta_computed)   # every N steps
+```
+
+The delta head learns to predict behavioral shifts cheaply, while periodic grounding ensures accuracy.
 
 ---
 
