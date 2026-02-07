@@ -1,327 +1,772 @@
-# Phase 4b — VAE for LoRA: Learning a Latent Adapter Manifold
+# Phase 4b — Discrete Codebook for LoRA: Quantizing the Adapter Manifold
 
-## Motivation
+## Core Idea
 
-Phases 4-5 train a generator that maps text conditions directly to LoRA weights
-(or behavioral deltas). This works, but the mapping is deterministic and the
-latent representation (512-dim projection embeddings) has no explicit structure.
+Instead of generating continuous LoRA weights from text, **learn a finite
+dictionary of LoRA building blocks** and reduce adapter generation to
+**picking and composing discrete codes**.
 
-A VAE bottleneck between the text encoder and the weight decoder would give us:
+An adapter is a sequence of 24 layer-level decisions. Each decision picks from a
+learned codebook of "what this layer should do." Generation becomes
+classification, not regression. The codebook itself *is* the manifold.
 
-- **Structured latent space** — smooth interpolation, disentanglement
-- **Uncertainty quantification** — variance estimates on generated adapters
-- **Regularized generalization** — KL pressure prevents memorization of training adapters
-- **Conditional generation** — sample diverse adapters for the same task description
+```
+Current (Phase 5):   text → MLP → 168 continuous (A,B) matrices
+Proposed (Phase 4b): text → encoder → 24 code picks → codebook lookup → LoRA weights
+```
 
-Two recent papers validate this direction:
+This gives us:
+- **Efficiency** — inference is codebook lookup, not dense MLP decoding
+- **Interpretability** — each code is a reusable, inspectable "layer behavior"
+- **Sharp generation** — discrete codes don't blur across modes
+- **Manifold discovery** — the codebook reveals how many distinct adapter
+  patterns actually exist
 
-- **FVAE-LoRA** factorizes VAE latents into task-salient vs residual components
-- **ICM-LoRA** (IJCAI 2025) uses a Conditional VAE to generate LoRA parameters
-
-This proposal integrates a VAE into the existing LLGBM generator pipeline.
+Prior art: **FVAE-LoRA** (factorized VAE for LoRA), **ICM-LoRA** (IJCAI 2025,
+Conditional VAE for LoRA generation). Both validate the latent-variable approach;
+we push further by going fully discrete.
 
 ---
 
-## Data: What We Have
+## Why Discrete Over Continuous?
+
+The conversation that motivated this proposal identified several problems with
+continuous VAE over adapter weights:
+
+1. **Non-identifiability**: `DW = B @ A` has infinite `(A,B)` factorizations.
+   A Gaussian VAE sees the same function as many points → mushy latent.
+2. **Multimodal data**: DnD adapters span distinct task families (commonsense,
+   math, coding). Gaussian prior averages modes → "blurry adapters."
+3. **Row-wise linear correlation is weak**: Flattened weight matrices don't have
+   the structure that makes standard VAEs work well.
+
+All three problems point toward **discrete codes**:
+
+| Problem | Continuous VAE | Discrete VQ |
+|---------|---------------|-------------|
+| Non-identifiability | Learns mushy latent | Codes snap to prototypes; gauge freedom absorbed |
+| Multimodal | Gaussian averages modes | Each code IS a mode |
+| Weak linear structure | MLP must learn nonlinear manifold | Codebook stores actual exemplars |
+
+The gauge-fixing problem (Trick #1 from the original conversation) still matters
+— we should quantize **DW-space** (`B @ A * scaling`), not raw `(A, B)`. But
+discrete codes are more forgiving because the codebook entries themselves become
+the canonical representatives.
+
+---
+
+## Data
 
 From [`Jerrylz/DnD-checkpoints-and-logs`](https://huggingface.co/datasets/Jerrylz/DnD-checkpoints-and-logs):
 
-| Family | Files | Size | Tasks |
-|--------|-------|------|-------|
-| **Qwen2.5-0.5B LoRA** | 28 | ~125 GB | ARC-c/e, BoolQ, OBQA, PIQA, WinoGrande, HellaSwag + ablations |
-| **Qwen2.5-1.5B LoRA** | 3 | ~21 GB | Coding, Math |
-| **Qwen2.5-7B LoRA** | 2 | ~16 GB | Coding, Math |
-| **Qwen3-VL LoRA** | 1 | ~10 GB | Multimodal |
+| Family | Checkpoints | Tasks |
+|--------|-------------|-------|
+| **Qwen2.5-0.5B LoRA** | 28 | ARC-c/e, BoolQ, OBQA, PIQA, WinoGrande, HellaSwag + ablations |
+| **Qwen2.5-1.5B LoRA** | 3 | Coding, Math |
+| **Qwen2.5-7B LoRA** | 2 | Coding, Math |
+| **Qwen3-VL LoRA** | 1 | Multimodal |
 
-The 0.5B family is the natural starting point: 28 checkpoints across 6+ tasks,
-plus extractor variants (GloVe, T5, Qwen-7B), conditioning ablations
-(128/256/512/1024-dim), and train/test split experiments. This is enough
-diversity to learn a meaningful manifold while keeping shapes consistent.
+**Start with:** The 28 `qwen0.5lora__*` checkpoints. Same architecture (24
+layers, rank 16, 7 targets), diverse tasks. Hold out 3 for validation.
 
-Each `.pth` checkpoint is a full DnD generator state. The LoRA weights within
-each can be extracted via the existing `Qwen2515LoRA_Tokenizer2D` tokenizer
-or loaded directly as `{layer}.{proj}.lora_{A,B}.weight` dicts.
-
-**Recommendation:** Start with `qwen0.5lora__*` (28 checkpoints). Hold out
-2-3 for validation (e.g., one ARC variant, one reconstruction variant, one
-conditioning ablation).
-
----
-
-## The Core Problem: Non-Identifiability of (A, B)
-
-The same functional update `DW = B @ A` can be represented by infinitely many
-`(A, B)` pairs — any invertible matrix `R` gives `B' = B @ R`, `A' = R^{-1} @ A`
-with identical `DW`. If we VAE raw `(A, B)` tensors, the encoder sees the same
-function as many distinct points in weight-space, producing a mushy latent that
-doesn't correspond to stable meaning.
-
-### Trick 1: Canonical Representation (Gauge Fixing)
-
-Instead of encoding raw `(A, B)`, encode one of:
-
-| Representation | Formula | Pros | Cons |
-|----------------|---------|------|------|
-| **DW-space** | `DW_i = B_i @ A_i * scaling` | Unique, compact | Loses factorization; `rank(DW)` reveals rank but dims are large |
-| **SVD-canonical** | `DW = U @ S @ V^T`, store `(U[:,:r], S[:r], V[:,:r])` | Unique up to sign; compact | Sign ambiguity on singular vectors |
-| **QR-canonical** | `Q, R = qr(A^T)`, store `(R^T, B @ Q)` | Deterministic (positive diag R) | Less standard |
-| **A-normalized** | `A' = A / ||A||_row`, `B' = B * ||A||_row` | Simple; preserves factorization | Not fully canonical |
-
-**Recommended for Phase 4b:** Use **DW-space** (`B @ A * scaling`) per layer per
-target. This is the most principled choice — it's the actual function the adapter
-computes, and it's unique. The decoder then needs to output a low-rank
-factorization of DW, which can be done by predicting `U, S, V` or by directly
-predicting `A, B` with a rank constraint.
-
-For Qwen2.5-0.5B with rank=16:
-
-```
-DW per target: (out_dim, in_dim)
-  q_proj: (896, 896)     = 802K params
-  k_proj: (128, 896)     = 115K params  (GQA heads)
-  v_proj: (128, 896)     = 115K params
-  o_proj: (896, 896)     = 802K params
-  gate:   (4864, 896)    = 4.4M params
-  up:     (4864, 896)    = 4.4M params
-  down:   (896, 4864)    = 4.4M params
-```
-
-These are too large to flatten naively. We must compress per-layer DW into a
-token representation.
-
-### Trick 2: Low-Rank Token Representation
-
-Since `rank(DW) = rank(B @ A) <= 16`, each DW lives on a rank-16 manifold.
-Represent each target's update as a **compact token**:
-
-```
-token_i = [vec(S_i), vec(U_i[:, :r]), vec(V_i[:, :r])]
-```
-
-Or more practically, since the current generator already produces `(A, B)` via
-64-dim base patterns with periodic extension:
-
-```
-token_i = [A_base_i (rank x 64), B_base_i (64 x rank)]
-         = 2 * rank * 64 = 2048 floats per target
-```
-
-This matches the existing `A_decoder`/`B_decoder` output shape and keeps the
-periodic extension mechanism intact.
+Each checkpoint yields **24 layers x 7 targets = 168 (A, B) pairs**. That's
+28 x 168 = **4,704 layer-target weight pairs** to learn from — enough for a
+codebook of ~64-256 entries.
 
 ---
 
 ## Architecture
 
-### Current Pipeline (Phase 5)
+### Overview
 
 ```
-Text (B, N, L)
-    |
-[TextEncoder] --> (B, N, 384)
-    |
-[SharedProj 384->512] --> (B, N, 512)
-    |
-    +---> [DeltaHead] --> d_pred (B, 896)
-    |
-    +---> pool(N) --> (B, 512) --> [LoRA Head] --> weights
+┌─────────────────────────────────────────────────────────────┐
+│                   STAGE 1: Learn the Codebook               │
+│                   (auto-encoding, no text)                   │
+│                                                             │
+│  Teacher adapter (24 layers)                                │
+│       │                                                     │
+│  Per-layer: DW_i = B_i @ A_i * scaling    (gauge-fix)      │
+│       │                                                     │
+│  [Layer Encoder] → e_i ∈ R^d                                │
+│       │                                                     │
+│  [VQ] → code_i ∈ {1..K},  z_i = Codebook[code_i]          │
+│       │                                                     │
+│  [Layer Decoder] → DW_i_reconstructed                       │
+│       │                                                     │
+│  Loss = L_recon + L_commit + L_codebook                     │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                   STAGE 2: Learn the Prior                   │
+│                   (conditional generation)                   │
+│                                                             │
+│  Text condition                                             │
+│       │                                                     │
+│  [TextEncoder] → (B, 384)                                   │
+│       │                                                     │
+│  [Code Predictor] → logits (B, 24, K)                       │
+│       │                                                     │
+│  argmax or sample → code sequence (B, 24)                   │
+│       │                                                     │
+│  [Frozen codebook lookup + decoder] → LoRA weights          │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### Proposed Pipeline (Phase 4b)
+Two-stage training separates "what are the building blocks?" from "when to use
+which block?" This is the standard VQ-VAE recipe (van den Oord et al., 2017)
+adapted for weight space.
 
-```
-Text (B, N, L)
-    |
-[TextEncoder] --> (B, N, 384)
-    |
-[SharedProj 384->512] --> (B, N, 512)
-    |
-pool(N) --> (B, 512)       [optional: also DeltaHead]
-    |
-[VAE Encoder] --> mu (B, z_dim), logvar (B, z_dim)
-    |
-[Reparameterize] --> z (B, z_dim)
-    |
-    +---> [LayerCodeGen] --> z_layer (B, num_layers, z_layer_dim)
-    |
-    +---> [LoRA Decoder] --> weights per layer
-    |
-    +---> [DeltaDecoder] --> d_pred (B, hidden_size)  [fast path]
-```
+### Stage 1: VQ Auto-Encoder for Layer Patterns
 
-### Key Components
+#### Representation: What Gets Quantized
 
-#### 2a. VAE Encoder
+Each layer `i` in an adapter has 7 target projections (q/k/v/o/gate/up/down).
+We gauge-fix each to DW-space, then compress:
 
 ```python
-class VAEEncoder(nn.Module):
-    """Maps condition embedding to latent distribution."""
+# For layer i, target t:
+DW_it = B_it @ A_it * scaling   # (out_dim, in_dim) — unique functional update
 
-    def __init__(self, input_dim=512, hidden_dim=512, latent_dim=64):
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
-        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
-
-    def forward(self, x):
-        h = F.gelu(self.fc1(x))
-        h = F.gelu(self.fc2(h))
-        return self.fc_mu(h), self.fc_logvar(h)
+# Since rank(DW) <= 16, compress via truncated SVD:
+U, S, Vh = svd(DW_it)
+token_it = concat(S[:r], flatten(U[:,:r]), flatten(Vh[:r,:]))  # compact token
 ```
 
-**Latent dimension:** 64 (compresses 512-dim condition to 64-dim; the existing
-generator already does 512 -> `num_projections * proj_embed_dim`, so 64 is a
-reasonable bottleneck).
+But DW dimensions vary across targets:
 
-#### 2b. Hierarchical Latent Structure
+| Target | Shape | Rank-16 SVD token size |
+|--------|-------|----------------------|
+| q_proj | (896, 896) | 16 + 896\*16 + 896\*16 = 28,688 |
+| k_proj | (128, 896) | 16 + 128\*16 + 896\*16 = 16,400 |
+| gate_proj | (4864, 896) | 16 + 4864\*16 + 896\*16 = 92,176 |
 
-Adapters are not i.i.d. matrices — they have cross-layer structure ("this task
-tweaks attention in mid layers"). A flat latent ignores this.
+These are too large to quantize directly. Instead, use **a learned projection
+to a fixed-size embedding** before quantization:
 
 ```python
-class HierarchicalDecoder(nn.Module):
-    """Decode z_global into per-layer codes + LoRA weights."""
+class LayerEncoder(nn.Module):
+    """Encode one layer's 7 DW matrices into a single embedding."""
 
-    def __init__(self, latent_dim=64, num_layers=24, layer_code_dim=32):
-        # Global-to-layer mapping
-        self.layer_code_gen = nn.Sequential(
-            nn.Linear(latent_dim, 256),
-            nn.GELU(),
-            nn.Linear(256, num_layers * layer_code_dim),
-        )
-        # Per-target decoders (shared across layers)
-        self.target_decoders = nn.ModuleDict({
-            target: nn.Sequential(
-                nn.Linear(latent_dim + layer_code_dim, 256),
+    def __init__(self, lora_rank=16, base_dim=64, embed_dim=256):
+        super().__init__()
+        # Per-target projectors: project each DW's SVD factors to fixed size
+        # Input: rank singular values + rank*base_dim for U/V factors
+        self.target_projectors = nn.ModuleDict()
+        for target in TARGETS:
+            in_size = lora_rank + 2 * lora_rank * base_dim  # S + U_base + V_base
+            self.target_projectors[target] = nn.Sequential(
+                nn.Linear(in_size, 256),
                 nn.GELU(),
-                nn.Linear(256, rank * 64 * 2),  # A_base + B_base
+                nn.Linear(256, embed_dim // 7),  # Each target contributes a slice
             )
-            for target in ['q', 'k', 'v', 'o', 'gate', 'up', 'down']
-        })
 
-    def forward(self, z_global):
-        B = z_global.shape[0]
-        # Generate per-layer codes
-        layer_codes = self.layer_code_gen(z_global)
-        layer_codes = layer_codes.view(B, self.num_layers, -1)
+        # Cross-target fusion
+        self.fusion = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
 
-        weights = {}
-        for layer_idx in range(self.num_layers):
-            z_layer = layer_codes[:, layer_idx]            # (B, layer_code_dim)
-            z_combined = torch.cat([z_global, z_layer], -1)  # (B, latent + layer_code)
-
-            for target_name, decoder in self.target_decoders.items():
-                raw = decoder(z_combined)  # (B, rank*64*2)
-                A_base, B_base = raw.chunk(2, dim=-1)
-                # ... periodic extension + scaling (same as current generator)
+    def forward(self, layer_dw_tokens: Dict[str, Tensor]) -> Tensor:
+        """
+        Args:
+            layer_dw_tokens: {target_name: compact_svd_token} for one layer
+        Returns:
+            (embed_dim,) embedding for this layer
+        """
+        parts = []
+        for target in TARGETS:
+            parts.append(self.target_projectors[target](layer_dw_tokens[target]))
+        fused = torch.cat(parts, dim=-1)
+        return self.fusion(fused)
 ```
 
-This gives the model `z_global` for "what kind of adapter" and `z_layer[i]` for
-"how this layer participates." The per-target decoders are shared across layers
-(parameter efficient) but conditioned on layer-specific codes.
+The key insight: we project each target's rank-16 SVD factors through a small MLP
+to get a fixed-size slice, concatenate all 7 targets, then fuse. This compresses
+an entire layer's LoRA update into a single `embed_dim`-sized vector (e.g., 256d).
 
-#### 2c. Prior Choice: VQ-VAE vs Gaussian vs Mixture
+The "base_dim=64" comes from the existing generator's periodic extension trick:
+the current `A_decoder` outputs `rank * 64` floats. We reuse this: truncate/pad
+the SVD factors to `rank x 64` before encoding. This aligns with the decoder's
+existing reconstruction mechanism.
 
-The DnD adapters span distinct task families (commonsense reasoning, math,
-coding, multimodal). A plain Gaussian prior averages modes ("blurry adapters").
-
-| Prior | When to Use | Complexity |
-|-------|-------------|------------|
-| **Gaussian** | Baseline; if tasks are similar | Low |
-| **GMM / VampPrior** | Continuous but multimodal | Medium |
-| **VQ-VAE** | Distinct clusters; discrete codes | Medium |
-| **Flow prior** | Expressive continuous | High |
-
-**Recommended for Phase 4b:** Start with **Gaussian** (simplest, validates the
-architecture), then upgrade to **VQ-VAE** if latent space shows clear clusters.
-
-For VQ-VAE, the codebook would be:
+#### Vector Quantization
 
 ```python
-class VQLayer(nn.Module):
-    """Vector Quantization layer."""
+class VectorQuantizer(nn.Module):
+    """
+    VQ layer with EMA codebook updates and dead code reset.
 
-    def __init__(self, latent_dim=64, num_codes=128, commitment_cost=0.25):
-        self.codebook = nn.Embedding(num_codes, latent_dim)
-        self.commitment_cost = commitment_cost
-
-    def forward(self, z_e):
-        # Find nearest codebook entry
-        distances = torch.cdist(z_e, self.codebook.weight)
-        indices = distances.argmin(dim=-1)
-        z_q = self.codebook(indices)
-
-        # Straight-through estimator
-        z_q_st = z_e + (z_q - z_e).detach()
-
-        # Losses
-        commitment_loss = F.mse_loss(z_e, z_q.detach())
-        codebook_loss = F.mse_loss(z_q, z_e.detach())
-        vq_loss = codebook_loss + self.commitment_cost * commitment_loss
-
-        return z_q_st, vq_loss, indices
-```
-
-**Number of codes:** 128 (we have ~28 adapters but want sub-adapter-level
-granularity — different layers/behaviors within adapters should activate
-different codes).
-
----
-
-## Loss Function
-
-### Gaussian VAE
-
-```
-L_total = L_recon + beta * L_KL [+ L_delta + L_consistency]
-
-where:
-  L_recon  = MSE(DW_pred, DW_teacher)  or  MSE(A_pred, A_teacher) + MSE(B_pred, B_teacher)
-  L_KL     = KL(q(z|x), N(0,I))
-  L_delta  = MSE(d_pred, d_teacher)    [behavioral supervision, optional]
-  L_consistency = MSE(d_computed, d_pred)  [computed delta matches predicted]
-```
-
-### VQ-VAE
-
-```
-L_total = L_recon + L_codebook + beta_commit * L_commitment [+ L_delta]
-```
-
-### Beta Annealing Schedule
-
-KL collapse is the main risk with VAE for structured outputs. Use cyclical
-annealing or monotonic warmup:
-
-```
-beta(t) = min(beta_max, beta_min + (beta_max - beta_min) * t / warmup_steps)
-```
-
-With `beta_min=0.0`, `beta_max=0.1`, `warmup_steps=200`. Keep beta small —
-reconstruction quality matters more than prior matching for LoRA generation.
-
-### Integration with Existing Losses
-
-Phase 4b's loss is a superset of the existing `DeltaGuidedLoss`:
-
-```python
-class VAELoRALoss(nn.Module):
-    """VAE loss for LoRA generation with optional behavioral supervision."""
+    Uses exponential moving average (EMA) for codebook updates instead of
+    gradient descent — more stable and doesn't require separate codebook optimizer.
+    """
 
     def __init__(
         self,
-        lambda_recon: float = 1.0,       # Weight reconstruction
-        lambda_kl: float = 0.1,          # KL divergence (or VQ losses)
-        lambda_delta: float = 1.0,        # Behavioral delta matching
-        lambda_consistency: float = 0.5,  # d_computed vs d_predicted
-        beta_schedule: str = "warmup",    # "constant", "warmup", "cyclical"
-        beta_warmup_steps: int = 200,
-        beta_max: float = 0.1,
-        normalize_delta: bool = True,
-        recon_target: str = "delta_w",    # "delta_w", "ab_canonical", "both"
+        num_codes: int = 256,
+        embed_dim: int = 256,
+        commitment_cost: float = 0.25,
+        ema_decay: float = 0.99,
+        dead_code_threshold: int = 2,  # Reset codes used < N times per epoch
+    ):
+        super().__init__()
+        self.num_codes = num_codes
+        self.embed_dim = embed_dim
+        self.commitment_cost = commitment_cost
+        self.ema_decay = ema_decay
+        self.dead_code_threshold = dead_code_threshold
+
+        # Codebook
+        self.codebook = nn.Embedding(num_codes, embed_dim)
+        nn.init.uniform_(self.codebook.weight, -1/num_codes, 1/num_codes)
+
+        # EMA tracking
+        self.register_buffer('ema_count', torch.zeros(num_codes))
+        self.register_buffer('ema_weight', self.codebook.weight.clone())
+        self.register_buffer('usage_count', torch.zeros(num_codes, dtype=torch.long))
+
+    def forward(self, z_e: Tensor) -> Tuple[Tensor, Tensor, LongTensor]:
+        """
+        Args:
+            z_e: encoder output (..., embed_dim)
+        Returns:
+            z_q: quantized (..., embed_dim), with straight-through gradient
+            vq_loss: commitment + codebook loss
+            indices: code indices (...,)
+        """
+        flat = z_e.reshape(-1, self.embed_dim)
+
+        # Find nearest codes
+        distances = torch.cdist(flat, self.codebook.weight)
+        indices = distances.argmin(dim=-1)
+        z_q = self.codebook(indices).view_as(z_e)
+
+        # EMA update (training only)
+        if self.training:
+            self._ema_update(flat, indices)
+
+        # Losses
+        commitment = F.mse_loss(z_e, z_q.detach())
+        codebook_loss = F.mse_loss(z_q, z_e.detach())
+        vq_loss = codebook_loss + self.commitment_cost * commitment
+
+        # Straight-through estimator
+        z_q = z_e + (z_q - z_e).detach()
+
+        return z_q, vq_loss, indices.view(z_e.shape[:-1])
+
+    def _ema_update(self, flat, indices):
+        """EMA codebook update."""
+        with torch.no_grad():
+            onehot = F.one_hot(indices, self.num_codes).float()
+            self.ema_count = self.ema_decay * self.ema_count + (1-self.ema_decay) * onehot.sum(0)
+            self.ema_weight = self.ema_decay * self.ema_weight + (1-self.ema_decay) * (onehot.T @ flat)
+
+            n = self.ema_count.unsqueeze(1)
+            self.codebook.weight.data = self.ema_weight / n.clamp(min=1e-5)
+
+            # Track usage
+            self.usage_count += onehot.sum(0).long()
+
+    def reset_dead_codes(self, encoder_outputs: Tensor):
+        """Replace dead codes with random encoder outputs."""
+        dead = self.usage_count < self.dead_code_threshold
+        if dead.any():
+            n_dead = dead.sum().item()
+            # Sample random encoder outputs as replacement
+            perm = torch.randperm(encoder_outputs.size(0))[:n_dead]
+            self.codebook.weight.data[dead] = encoder_outputs[perm].detach()
+            self.usage_count[dead] = self.dead_code_threshold
+```
+
+#### Layer Decoder
+
+Mirrors the existing generator's `A_decoder`/`B_decoder` + periodic extension:
+
+```python
+class LayerDecoder(nn.Module):
+    """Decode quantized embedding back to 7 (A, B) pairs for one layer."""
+
+    def __init__(self, embed_dim=256, lora_rank=16, base_dim=64):
+        super().__init__()
+        self.target_decoders = nn.ModuleDict()
+        for target in TARGETS:
+            self.target_decoders[target] = nn.ModuleDict({
+                'A': nn.Sequential(
+                    nn.Linear(embed_dim, 256), nn.GELU(),
+                    nn.Linear(256, lora_rank * base_dim),
+                ),
+                'B': nn.Sequential(
+                    nn.Linear(embed_dim, 256), nn.GELU(),
+                    nn.Linear(256, lora_rank * base_dim),
+                ),
+            })
+        self.scales = nn.Parameter(torch.ones(7, 2) * 0.01)
+
+    def forward(self, z_q: Tensor, dim_info: List[Dict]) -> Dict[str, Tensor]:
+        """Decode one layer's quantized code into LoRA weight dict."""
+        weights = {}
+        for t_idx, (target, decoder) in enumerate(self.target_decoders.items()):
+            info = dim_info[t_idx]
+            A_base = decoder['A'](z_q).view(self.lora_rank, -1)
+            B_base = decoder['B'](z_q).view(-1, self.lora_rank)
+
+            # Periodic extension (same as existing generator)
+            in_d, out_d = info["in_dim"], info["out_dim"]
+            A = A_base[:, :in_d % 64 or 64].repeat(1, (in_d//64)+1)[:, :in_d]
+            B = B_base[:out_d % 64 or 64, :].repeat((out_d//64)+1, 1)[:out_d, :]
+
+            weights[info["A_key"]] = A * self.scales[t_idx, 0]
+            weights[info["B_key"]] = B * self.scales[t_idx, 1]
+        return weights
+```
+
+This reuses the exact periodic extension mechanism from `LoRAGenerator`, so
+the decoder output format is directly compatible with `FunctionalLoRA`.
+
+#### Residual VQ (RVQ) for Progressive Detail
+
+One codebook level may not capture fine-grained adapter differences. Residual VQ
+adds levels that encode the reconstruction error from previous levels:
+
+```
+Level 1: z_q1 = VQ_1(z_e)           → captures coarse adapter pattern
+Level 2: z_q2 = VQ_2(z_e - z_q1)    → captures residual detail
+Level 3: z_q3 = VQ_3(z_e - z_q1 - z_q2)  → fine corrections
+
+Final:   z_q = z_q1 + z_q2 + z_q3
+```
+
+This is the architecture behind SoundStream/Encodec for audio. For LoRA:
+
+- **Level 1** (K=64 codes): "Is this an attention-heavy or MLP-heavy layer update?"
+- **Level 2** (K=64 codes): "What's the specific direction of the update?"
+- **Level 3** (K=64 codes): "Fine magnitude/sign corrections"
+
+At inference, you can trade quality for speed by using fewer levels. Level 1
+alone might capture 80% of the variance.
+
+```python
+class ResidualVQ(nn.Module):
+    """Multi-level residual vector quantization."""
+
+    def __init__(self, num_levels=3, num_codes=64, embed_dim=256):
+        super().__init__()
+        self.levels = nn.ModuleList([
+            VectorQuantizer(num_codes, embed_dim)
+            for _ in range(num_levels)
+        ])
+
+    def forward(self, z_e):
+        z_q_total = torch.zeros_like(z_e)
+        total_vq_loss = 0.0
+        all_indices = []
+        residual = z_e
+
+        for vq in self.levels:
+            z_q, vq_loss, indices = vq(residual)
+            z_q_total = z_q_total + z_q
+            total_vq_loss = total_vq_loss + vq_loss
+            all_indices.append(indices)
+            residual = z_e - z_q_total.detach()  # Next level encodes the residual
+
+        return z_q_total, total_vq_loss, all_indices
+
+    def decode_at_level(self, all_indices, max_level):
+        """Partial decode using only first N levels (quality/speed tradeoff)."""
+        z_q = torch.zeros(...)
+        for level_idx in range(max_level):
+            z_q = z_q + self.levels[level_idx].codebook(all_indices[level_idx])
+        return z_q
+```
+
+#### Full Auto-Encoder
+
+```python
+class LoRACodebook(nn.Module):
+    """
+    VQ auto-encoder for LoRA adapters.
+
+    Encodes each layer's 7-target LoRA update into a discrete code,
+    decodes back to weight matrices. The codebook learns prototypical
+    "layer behaviors" across all training adapters.
+    """
+
+    def __init__(
+        self,
+        num_codes: int = 256,
+        embed_dim: int = 256,
+        lora_rank: int = 16,
+        base_dim: int = 64,
+        num_layers: int = 24,
+        num_rq_levels: int = 3,      # Residual VQ levels
+        use_residual_vq: bool = True,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.encoder = LayerEncoder(lora_rank, base_dim, embed_dim)
+        self.decoder = LayerDecoder(embed_dim, lora_rank, base_dim)
+
+        if use_residual_vq:
+            self.quantizer = ResidualVQ(num_rq_levels, num_codes, embed_dim)
+        else:
+            self.quantizer = VectorQuantizer(num_codes, embed_dim)
+
+        # Optional: cross-layer transformer to capture dependencies BEFORE quantizing
+        self.cross_layer_attn = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=embed_dim, nhead=4, batch_first=True, dropout=0.1
+            ),
+            num_layers=2,
+        )
+
+    def encode(self, adapter_dw_tokens: List[Dict[str, Tensor]]) -> Tensor:
+        """
+        Encode a full adapter (24 layers) into pre-quantization embeddings.
+
+        Args:
+            adapter_dw_tokens: List of 24 dicts, each mapping target names
+                              to compact SVD tokens for that layer.
+        Returns:
+            (24, embed_dim) pre-quantization embeddings
+        """
+        layer_embeds = []
+        for layer_tokens in adapter_dw_tokens:
+            e = self.encoder(layer_tokens)
+            layer_embeds.append(e)
+        layer_embeds = torch.stack(layer_embeds)  # (24, embed_dim)
+
+        # Cross-layer attention: let layers see each other before quantizing
+        layer_embeds = self.cross_layer_attn(layer_embeds.unsqueeze(0)).squeeze(0)
+
+        return layer_embeds
+
+    def quantize(self, layer_embeds: Tensor):
+        """Quantize layer embeddings to discrete codes."""
+        return self.quantizer(layer_embeds)
+
+    def decode(self, z_q: Tensor, dim_info_per_layer) -> Dict[str, Tensor]:
+        """Decode quantized layer codes back to full adapter weights."""
+        all_weights = {}
+        for layer_idx in range(self.num_layers):
+            layer_weights = self.decoder(z_q[layer_idx], dim_info_per_layer[layer_idx])
+            all_weights.update(layer_weights)
+        return all_weights
+
+    def forward(self, adapter_dw_tokens, dim_info_per_layer):
+        layer_embeds = self.encode(adapter_dw_tokens)
+        z_q, vq_loss, indices = self.quantize(layer_embeds)
+        weights_recon = self.decode(z_q, dim_info_per_layer)
+        return weights_recon, vq_loss, indices, layer_embeds
+```
+
+### Stage 2: Code Predictor (Conditional Prior)
+
+Once the codebook is trained, generation becomes **predicting a sequence of
+24 code indices** from a text condition:
+
+```python
+class CodePredictor(nn.Module):
+    """
+    Predict code sequence from text condition.
+
+    This is a classifier, not a regressor. For each of the 24 layers,
+    predict which of K codebook entries to use.
+    """
+
+    def __init__(
+        self,
+        text_embed_dim: int = 384,
+        num_layers: int = 24,
+        num_codes: int = 256,
+        hidden_dim: int = 512,
+        num_rq_levels: int = 3,
+    ):
+        super().__init__()
+
+        # Shared text processing
+        self.proj = nn.Sequential(
+            nn.Linear(text_embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+        )
+
+        # Layer position embeddings
+        self.layer_pos = nn.Embedding(num_layers, hidden_dim)
+
+        # Cross-attention: layer queries attend to text condition
+        self.cross_attn = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(
+                d_model=hidden_dim, nhead=4, batch_first=True, dropout=0.1,
+            ),
+            num_layers=2,
+        )
+
+        # Per-level code classifiers (for RVQ)
+        self.code_heads = nn.ModuleList([
+            nn.Linear(hidden_dim, num_codes)
+            for _ in range(num_rq_levels)
+        ])
+
+    def forward(self, text_embedding: Tensor) -> List[Tensor]:
+        """
+        Args:
+            text_embedding: (B, text_embed_dim) from frozen text encoder
+        Returns:
+            List of (B, 24, K) logits, one per RVQ level
+        """
+        B = text_embedding.shape[0]
+
+        # Process text condition
+        memory = self.proj(text_embedding).unsqueeze(1)  # (B, 1, hidden)
+
+        # Layer queries
+        layer_ids = torch.arange(self.num_layers, device=text_embedding.device)
+        queries = self.layer_pos(layer_ids).unsqueeze(0).expand(B, -1, -1)
+
+        # Cross-attention: layers attend to text
+        h = self.cross_attn(queries, memory)  # (B, 24, hidden)
+
+        # Classify each layer at each RVQ level
+        all_logits = [head(h) for head in self.code_heads]
+        return all_logits  # List of (B, 24, K)
+
+    def predict_codes(self, text_embedding: Tensor, temperature=0.0) -> List[LongTensor]:
+        """Generate code sequences (inference)."""
+        all_logits = self.forward(text_embedding)
+        codes = []
+        for logits in all_logits:
+            if temperature == 0:
+                codes.append(logits.argmax(dim=-1))
+            else:
+                probs = F.softmax(logits / temperature, dim=-1)
+                codes.append(torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(logits.shape[:2]))
+        return codes
+```
+
+Key insight: **this is 24 classification problems, not weight regression**. A
+24-layer adapter with K=256 codes per level and 3 RVQ levels requires predicting
+24 x 3 = 72 categorical distributions. Compare to the current generator which
+outputs 168 x 2 continuous matrices.
+
+### Integration with Existing Pipeline
+
+The `CodePredictor` replaces `LoRAGenerator`'s continuous `lora_head`. Everything
+downstream stays the same:
+
+```
+[CodePredictor] → code indices → [Frozen LoRACodebook.decode()] → weight dict
+     ↓
+Same as current:
+     ↓
+[FunctionalLoRA.apply_lora_weights()] → delta_computed
+     ↓
+[DeltaGuidedLoss or behavioral eval]
+```
+
+The delta supervision from Phase 5 works unchanged — we just swap how
+weights are produced.
+
+---
+
+## Loss Functions
+
+### Stage 1: Codebook Learning
+
+```
+L_stage1 = L_recon + L_vq
+
+L_recon = sum over layers, targets:
+    MSE(DW_reconstructed, DW_teacher)
+
+L_vq = sum over RVQ levels:
+    L_codebook + beta_commit * L_commitment
+```
+
+Where `L_recon` compares in DW-space (gauge-fixed). This avoids the `(A, B)`
+non-identifiability entirely.
+
+Optionally add **behavioral reconstruction loss** — compute the delta from the
+reconstructed adapter and compare to the teacher's delta:
+
+```
+L_recon_behavioral = cosine_distance(
+    delta(decode(quantize(encode(adapter)))),
+    delta(adapter)
+)
+```
+
+This is expensive (requires base model forward pass) but ensures the codebook
+preserves *function*, not just weight magnitude.
+
+```python
+class CodebookLoss(nn.Module):
+    """Loss for Stage 1 codebook training."""
+
+    def __init__(
+        self,
+        lambda_recon: float = 1.0,
+        lambda_vq: float = 1.0,
+        lambda_behavioral: float = 0.0,    # Enable for behavioral recon
+        recon_space: str = "delta_w",       # "delta_w" or "ab"
     ):
         ...
+
+    def forward(self, weights_recon, weights_teacher, vq_loss,
+                delta_recon=None, delta_teacher=None):
+        losses = {}
+
+        # Reconstruction in DW-space
+        losses["recon"] = self._recon_loss(weights_recon, weights_teacher)
+        losses["vq"] = vq_loss
+
+        total = self.lambda_recon * losses["recon"] + self.lambda_vq * losses["vq"]
+
+        if delta_recon is not None and self.lambda_behavioral > 0:
+            losses["behavioral"] = 1 - F.cosine_similarity(
+                delta_recon, delta_teacher, dim=-1
+            ).mean()
+            total += self.lambda_behavioral * losses["behavioral"]
+
+        losses["loss"] = total
+        return losses
 ```
+
+### Stage 2: Code Prediction
+
+```
+L_stage2 = sum over RVQ levels:
+    CrossEntropy(predicted_logits, teacher_codes)
+  + lambda_delta * L_delta(delta_from_predicted, delta_teacher)
+```
+
+The cross-entropy loss is the primary signal. Delta supervision (optional) adds
+a behavioral gradient that helps when multiple code sequences produce similar
+adapters.
+
+```python
+class CodePredictionLoss(nn.Module):
+    """Loss for Stage 2 code prediction."""
+
+    def __init__(
+        self,
+        lambda_ce: float = 1.0,
+        lambda_delta: float = 0.5,
+        label_smoothing: float = 0.1,
+    ):
+        ...
+
+    def forward(self, predicted_logits, teacher_codes, delta_pred=None,
+                delta_teacher=None):
+        losses = {}
+        total_ce = 0
+        for level, (logits, codes) in enumerate(zip(predicted_logits, teacher_codes)):
+            # logits: (B, 24, K), codes: (B, 24)
+            ce = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                codes.view(-1),
+                label_smoothing=self.label_smoothing,
+            )
+            total_ce += ce
+            losses[f"ce_level_{level}"] = ce
+
+        losses["ce_total"] = total_ce
+
+        total = self.lambda_ce * total_ce
+        if delta_pred is not None and self.lambda_delta > 0:
+            losses["delta"] = 1 - F.cosine_similarity(
+                delta_pred, delta_teacher, dim=-1
+            ).mean()
+            total += self.lambda_delta * losses["delta"]
+
+        losses["loss"] = total
+        return losses
+```
+
+---
+
+## What the Codebook Reveals (Manifold Discovery)
+
+After Stage 1 training, the codebook is a **complete catalog of how layers
+behave**. Analysis we can do immediately:
+
+### 1. Code Usage Histogram
+
+For each of the 28 adapters, record its 24-layer code sequence. Plot:
+
+- **How many unique codes are actually used?** If 256 codes exist but only
+  40 are used, the adapter manifold is ~40-dimensional, not 256.
+- **Usage frequency** — power-law? uniform? A few dominant codes?
+
+### 2. Code-to-Task Mapping
+
+Color each code by which tasks use it:
+
+```
+Code 17: [ARC-e: 80%, BoolQ: 60%, PIQA: 30%]  → "general reasoning pattern"
+Code 42: [ARC-e: 0%, BoolQ: 0%, HellaSwag: 90%] → "sentence completion specialist"
+Code 3:  [all tasks: 95%]                        → "universal early-layer identity"
+```
+
+If codes cluster by task, the codebook has learned a task taxonomy.
+
+### 3. Layer Position × Code Heatmap
+
+```
+         Code 0  Code 1  Code 2  ...  Code K
+Layer 0  [████]  [    ]  [██  ]  ...
+Layer 1  [████]  [    ]  [██  ]  ...
+Layer 12 [    ]  [████]  [    ]  ...   ← mid-layer divergence point
+Layer 23 [    ]  [██  ]  [████]  ...
+```
+
+Expect: early layers converge to few codes (universal patterns), mid/late
+layers diverge (task-specific behaviors).
+
+### 4. Code Arithmetic
+
+If the codebook is well-structured:
+
+```
+codes(ARC_adapter) ⊕ codes(math_adapter) → mixed-task adapter?
+```
+
+Replace specific layer codes from one adapter with codes from another:
+
+```
+Take ARC adapter's code sequence
+Swap layers 12-18 codes with BoolQ adapter's
+→ Does the resulting adapter do both tasks?
+```
+
+This is the discrete version of Phase 6's compositionality experiments,
+but much more precise — we're swapping specific layer behaviors, not
+interpolating in continuous weight space.
+
+---
+
+## Sizing the Codebook
+
+How many codes do we need? Consider:
+
+- **28 adapters x 24 layers = 672 layer-level data points**
+- With 7 targets per layer, there's internal structure, but the VQ
+  sees each layer as one vector
+- Rule of thumb: `K ≈ sqrt(N_datapoints)` for basic VQ → K ≈ 26
+- With RVQ (3 levels x 64 codes): effective codebook = 64^3 = 262K
+  combinations, but only 192 stored vectors
+
+| Config | Stored vectors | Effective combinations | Bits per layer |
+|--------|---------------|----------------------|---------------|
+| Flat K=64 | 64 | 64 | 6 |
+| Flat K=256 | 256 | 256 | 8 |
+| RVQ 3x64 | 192 | 262,144 | 18 |
+| RVQ 3x256 | 768 | 16.7M | 24 |
+
+**Recommended starting point:** RVQ with 3 levels x 64 codes.
+This gives enormous expressive capacity (262K combinations) while keeping
+the codebook small enough to avoid overfitting with 672 training examples.
 
 ---
 
@@ -329,480 +774,349 @@ class VAELoRALoss(nn.Module):
 
 ### Files to Create
 
-| File | Purpose |
-|------|---------|
-| `llgbm/vae.py` | `VAEEncoder`, `VAEDecoder`, `VQLayer`, `HierarchicalDecoder`, reparameterize |
-| `llgbm/canonical.py` | `compute_delta_w()`, `svd_canonicalize()`, `from_delta_w()` — gauge-fixing utilities |
+| File | Contents |
+|------|----------|
+| `llgbm/canonical.py` | `compute_delta_w()`, `to_svd_compact()`, `from_svd_compact()` — gauge-fixing |
+| `llgbm/codebook.py` | `VectorQuantizer`, `ResidualVQ`, `LoRACodebook` (full auto-encoder) |
+| `llgbm/code_predictor.py` | `CodePredictor` (Stage 2: text → code sequence) |
 
 ### Files to Modify
 
 | File | Changes |
 |------|---------|
-| `llgbm/generator.py` | Add `LoRAGeneratorVAE` class (extends `LoRAGeneratorWithDeltaHead`) |
-| `llgbm/losses.py` | Add `VAELoRALoss` class |
-| `llgbm/training.py` | Add `VAETrainingConfig` dataclass; modify `train_step()` to handle VAE outputs |
-| `llgbm/dataset.py` | Add `DnDCheckpointDataset` for loading .pth files from the HF dataset |
+| `llgbm/losses.py` | Add `CodebookLoss`, `CodePredictionLoss` |
+| `llgbm/dataset.py` | Add `AdapterDWDataset` (loads adapters, computes DW-space tokens) |
+| `llgbm/training.py` | Add `VQTrainingConfig` dataclass |
 | `llgbm/__init__.py` | Export new classes |
 
 ### New Notebook
 
 | File | Purpose |
 |------|---------|
-| `phase_4b_vae_lora.ipynb` | End-to-end: load data, train VAE, visualize latent space, evaluate |
+| `phase_4b_vq_lora.ipynb` | Stage 1 codebook training + analysis + Stage 2 prediction |
 
 ### Step-by-Step
 
-#### Step 1: Canonical Representation (`llgbm/canonical.py`)
-
-Build utilities to convert between `(A, B)` and canonical forms:
+#### Step 0: Gauge-Fixing Utilities (`llgbm/canonical.py`)
 
 ```python
 def compute_delta_w(A: Tensor, B: Tensor, scaling: float) -> Tensor:
-    """Compute DW = B @ A * scaling. The unique functional update."""
+    """DW = B @ A * scaling. The unique functional representation."""
     return B @ A * scaling
 
-def to_svd_canonical(delta_w: Tensor, rank: int) -> Tuple[Tensor, Tensor, Tensor]:
-    """SVD with sign convention: largest element of each U column is positive."""
+def to_svd_compact(delta_w: Tensor, rank: int, base_dim: int = 64) -> Tensor:
+    """
+    Compress DW to compact SVD-based token.
+
+    Returns: (rank + 2*rank*base_dim,) vector containing:
+        - rank singular values
+        - rank*base_dim flattened U factors (truncated/padded to base_dim rows)
+        - rank*base_dim flattened V factors (truncated/padded to base_dim cols)
+    """
     U, S, Vh = torch.linalg.svd(delta_w, full_matrices=False)
     U, S, Vh = U[:, :rank], S[:rank], Vh[:rank, :]
-    # Sign convention
+
+    # Sign convention: largest abs element of each U column is positive
     signs = torch.sign(U[U.abs().argmax(dim=0), range(rank)])
     U = U * signs.unsqueeze(0)
     Vh = Vh * signs.unsqueeze(1)
-    return U, S, Vh
 
-def from_svd_to_ab(U: Tensor, S: Tensor, Vh: Tensor) -> Tuple[Tensor, Tensor]:
-    """Recover (A, B) from SVD: A = diag(sqrt(S)) @ Vh, B = U @ diag(sqrt(S))."""
+    # Truncate/pad to base_dim for fixed-size representation
+    U_base = _truncate_pad(U, base_dim, dim=0)  # (base_dim, rank)
+    V_base = _truncate_pad(Vh.T, base_dim, dim=0)  # (base_dim, rank)
+
+    return torch.cat([S, U_base.flatten(), V_base.flatten()])
+
+def from_svd_compact(token: Tensor, rank: int, base_dim: int, out_dim: int, in_dim: int):
+    """Recover (A, B) from compact SVD token + periodic extension."""
+    S = token[:rank]
+    U_base = token[rank:rank + rank*base_dim].view(base_dim, rank)
+    V_base = token[rank + rank*base_dim:].view(base_dim, rank)
+
     sqrt_s = S.sqrt()
-    A = sqrt_s.unsqueeze(1) * Vh    # (rank, in_dim)
-    B = U * sqrt_s.unsqueeze(0)     # (out_dim, rank)
+    A_base = (V_base * sqrt_s.unsqueeze(0)).T   # (rank, base_dim)
+    B_base = (U_base * sqrt_s.unsqueeze(0))      # (base_dim, rank)
+
+    # Periodic extension to full dims (matches existing generator)
+    A = A_base[:, :in_dim % base_dim or base_dim].repeat(1, (in_dim//base_dim)+1)[:, :in_dim]
+    B = B_base[:out_dim % base_dim or base_dim, :].repeat((out_dim//base_dim)+1, 1)[:out_dim, :]
+
     return A, B
-```
 
-Also provide a function to canonicalize an entire adapter dict:
-
-```python
-def canonicalize_adapter(
-    weights: Dict[str, Tensor],
-    scaling: float,
-    method: str = "delta_w",
-) -> Dict[str, Tensor]:
-    """Convert (A_key, B_key) pairs to canonical representation."""
+def canonicalize_adapter(weights: Dict[str, Tensor], scaling: float) -> List[Dict[str, Tensor]]:
+    """Convert full adapter dict into list of per-layer DW token dicts."""
+    # Group by layer, compute DW for each target, return SVD compact tokens
     ...
 ```
 
-#### Step 2: DnD Checkpoint Dataset (`llgbm/dataset.py` addition)
+#### Step 1: VQ Codebook Module (`llgbm/codebook.py`)
 
-Load `.pth` checkpoints from the HF dataset and extract LoRA weights:
+Build `VectorQuantizer`, `ResidualVQ`, `LayerEncoder`, `LayerDecoder`,
+`LoRACodebook` as described in the Architecture section above.
+
+#### Step 2: Dataset for DW Tokens (`llgbm/dataset.py`)
 
 ```python
-class DnDCheckpointDataset(Dataset):
+class AdapterDWDataset(Dataset):
     """
-    Load LoRA weights from DnD .pth checkpoints.
+    Dataset of canonicalized adapter weight tokens.
 
-    Each .pth is a full generator state. We extract the teacher LoRA weights
-    it was trained to produce, canonicalize them, and pair with metadata
-    (task, conditioning strategy, etc.) parsed from the filename.
+    Loads teacher adapters, computes DW = B @ A * scaling for each layer/target,
+    produces compact SVD tokens for the codebook auto-encoder.
     """
 
-    def __init__(
-        self,
-        checkpoint_paths: List[str],
-        canonical_method: str = "delta_w",
-        scaling: float = 2.0,  # lora_alpha / lora_rank
-    ):
-        ...
+    def __init__(self, adapter_paths, scaling=2.0, lora_rank=16, base_dim=64):
+        self.samples = []
+        for path in adapter_paths:
+            weights = load_adapter(path)
+            dw_tokens = canonicalize_adapter(weights, scaling)
+            self.samples.append({
+                "dw_tokens": dw_tokens,      # List[Dict[str, Tensor]] per layer
+                "adapter_path": path,
+                "task": parse_task(path),
+            })
 
-    def _parse_filename(self, path: str) -> Dict[str, str]:
-        """Extract task/model/variant from filename like 'qwen0.5lora__ARC-e.pth'."""
-        ...
+    def __getitem__(self, idx):
+        return self.samples[idx]
 ```
 
-This bridges the HF dataset to the training pipeline.
-
-#### Step 3: VAE Module (`llgbm/vae.py`)
+#### Step 3: Stage 1 Training — Learn the Codebook
 
 ```python
-class LoRAVAE(nn.Module):
+def train_codebook(
+    codebook: LoRACodebook,
+    dataset: AdapterDWDataset,
+    config: VQTrainingConfig,
+):
     """
-    VAE for LoRA adapter generation.
+    Train the VQ auto-encoder on teacher adapters.
 
-    Encoder: condition embedding -> (mu, logvar)
-    Decoder: z -> per-layer LoRA weights (via hierarchical decoding)
-
-    Supports both Gaussian VAE and VQ-VAE modes.
+    Iterates over adapters, encodes each to layer embeddings, quantizes,
+    decodes, and optimizes reconstruction + VQ losses.
     """
+    optimizer = torch.optim.AdamW(codebook.parameters(), lr=config.lr)
 
-    def __init__(
-        self,
-        condition_dim: int = 512,
-        latent_dim: int = 64,
-        num_layers: int = 24,
-        layer_code_dim: int = 32,
-        lora_rank: int = 16,
-        base_pattern_dim: int = 64,
-        num_targets: int = 7,
-        mode: str = "gaussian",       # "gaussian" or "vq"
-        num_vq_codes: int = 128,
-        dim_info: List[Dict] = None,  # From generator._build_dim_info()
-    ):
-        super().__init__()
-        self.mode = mode
-        self.latent_dim = latent_dim
+    for epoch in range(config.num_epochs):
+        for sample in dataset:
+            dw_tokens = sample["dw_tokens"]
 
-        # Encoder
-        self.encoder = VAEEncoder(condition_dim, 512, latent_dim)
-
-        # VQ layer (if using VQ-VAE)
-        if mode == "vq":
-            self.vq = VQLayer(latent_dim, num_vq_codes)
-
-        # Hierarchical decoder
-        self.decoder = HierarchicalDecoder(
-            latent_dim=latent_dim,
-            num_layers=num_layers,
-            layer_code_dim=layer_code_dim,
-            lora_rank=lora_rank,
-            base_pattern_dim=base_pattern_dim,
-            num_targets=num_targets,
-            dim_info=dim_info,
-        )
-
-        # Optional: delta prediction from z (fast path)
-        self.delta_from_z = nn.Sequential(
-            nn.Linear(latent_dim, 512),
-            nn.GELU(),
-            nn.Linear(512, 896),  # hidden_size
-        )
-
-    def encode(self, condition_emb):
-        """Encode condition to latent distribution."""
-        mu, logvar = self.encoder(condition_emb)
-        return mu, logvar
-
-    def reparameterize(self, mu, logvar):
-        """Sample z via reparameterization trick."""
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            return mu + eps * std
-        return mu  # Use mean at inference
-
-    def decode(self, z):
-        """Decode z to LoRA weights."""
-        return self.decoder(z)
-
-    def forward(self, condition_emb, return_delta=True):
-        mu, logvar = self.encode(condition_emb)
-
-        if self.mode == "vq":
-            z_e = mu  # Use mu as continuous embedding
-            z, vq_loss, indices = self.vq(z_e)
-            kl_loss = vq_loss
-        else:
-            z = self.reparameterize(mu, logvar)
-            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1).mean()
-
-        lora_weights = self.decode(z)
-
-        results = {
-            "lora_weights": lora_weights,
-            "mu": mu,
-            "logvar": logvar,
-            "z": z,
-            "kl_loss": kl_loss,
-        }
-
-        if return_delta:
-            results["delta_pred"] = self.delta_from_z(z)
-
-        if self.mode == "vq":
-            results["vq_indices"] = indices
-
-        return results
-```
-
-#### Step 4: Generator Integration (`llgbm/generator.py` addition)
-
-```python
-class LoRAGeneratorVAE(nn.Module):
-    """
-    LoRA Generator with VAE bottleneck.
-
-    Extends LoRAGeneratorWithDeltaHead by inserting a VAE between
-    the shared projection and the LoRA/delta heads.
-    """
-
-    def __init__(
-        self,
-        cfg: TrainingConfig,
-        text_encoder: Optional[nn.Module] = None,
-        vae_mode: str = "gaussian",
-        latent_dim: int = 64,
-        num_vq_codes: int = 128,
-    ):
-        ...
-        # Reuse text encoder + shared_proj from parent
-        # Insert VAE between shared_proj output and heads
-        self.vae = LoRAVAE(
-            condition_dim=512,
-            latent_dim=latent_dim,
-            num_layers=cfg.num_layers,
-            mode=vae_mode,
-            num_vq_codes=num_vq_codes,
-            dim_info=self.dim_info,
-        )
-
-    def forward(self, condition_ids, attention_mask=None,
-                return_delta=True, return_lora=True):
-        # Encode text -> shared projection (same as parent)
-        embeddings = self._encode_embeddings(condition_ids, attention_mask)
-        shared = self.shared_proj(embeddings)
-        shared_pooled = shared.mean(dim=1)  # (B, 512)
-
-        # VAE forward
-        vae_out = self.vae(shared_pooled, return_delta=return_delta)
-
-        results = {
-            "mu": vae_out["mu"],
-            "logvar": vae_out["logvar"],
-            "z": vae_out["z"],
-            "kl_loss": vae_out["kl_loss"],
-            "embeddings": embeddings,
-        }
-
-        if return_lora:
-            results["lora_weights"] = vae_out["lora_weights"]
-        if return_delta:
-            results["delta_pred"] = vae_out["delta_pred"]
-
-        return results
-
-    def generate_from_z(self, z):
-        """Generate LoRA weights from a latent code (for interpolation/sampling)."""
-        return self.vae.decode(z)
-
-    def interpolate(self, condition_a, condition_b, alpha=0.5):
-        """Interpolate between two conditions in latent space."""
-        mu_a, _ = self.vae.encode(self._embed(condition_a))
-        mu_b, _ = self.vae.encode(self._embed(condition_b))
-        z_interp = (1 - alpha) * mu_a + alpha * mu_b
-        return self.vae.decode(z_interp)
-```
-
-#### Step 5: Loss Function (`llgbm/losses.py` addition)
-
-```python
-class VAELoRALoss(nn.Module):
-    """
-    Loss = lambda_recon * L_recon(weights_pred, weights_teacher)
-         + beta(t) * L_KL(q(z|x), p(z))
-         + lambda_delta * L_delta(d_pred, d_teacher)
-         + lambda_consistency * L_consistency(d_computed, d_pred)
-    """
-
-    def __init__(self, ...):
-        ...
-
-    def _get_beta(self, step: int) -> float:
-        """Beta annealing schedule."""
-        if self.beta_schedule == "constant":
-            return self.beta_max
-        elif self.beta_schedule == "warmup":
-            return min(self.beta_max, self.beta_max * step / self.beta_warmup_steps)
-        elif self.beta_schedule == "cyclical":
-            cycle = step % (2 * self.beta_warmup_steps)
-            if cycle < self.beta_warmup_steps:
-                return self.beta_max * cycle / self.beta_warmup_steps
-            return self.beta_max
-
-    def forward(self, vae_output, teacher_weights, delta_teacher,
-                delta_computed=None, step=0):
-        losses = {}
-
-        # Reconstruction loss (on canonical DW or raw A,B)
-        losses["loss_recon"] = self._recon_loss(
-            vae_output["lora_weights"], teacher_weights
-        )
-
-        # KL / VQ loss
-        beta = self._get_beta(step)
-        losses["loss_kl"] = vae_output["kl_loss"]
-        losses["loss_kl_scaled"] = beta * vae_output["kl_loss"]
-
-        # Delta loss
-        if "delta_pred" in vae_output and delta_teacher is not None:
-            losses["loss_delta"] = self._delta_loss(
-                vae_output["delta_pred"], delta_teacher
+            # Forward
+            weights_recon, vq_loss, indices, layer_embeds = codebook(
+                dw_tokens, dim_info_per_layer
             )
 
-        # Consistency loss
-        if delta_computed is not None and "delta_pred" in vae_output:
-            losses["loss_consistency"] = self._delta_loss(
-                delta_computed, vae_output["delta_pred"].detach()
-            )
+            # Reconstruction loss in DW-space
+            recon_loss = compute_dw_reconstruction_loss(weights_recon, dw_tokens)
+            loss = recon_loss + vq_loss
 
-        # Total
-        losses["loss"] = (
-            self.lambda_recon * losses["loss_recon"]
-            + losses["loss_kl_scaled"]
-            + self.lambda_delta * losses.get("loss_delta", 0)
-            + self.lambda_consistency * losses.get("loss_consistency", 0)
-        )
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        losses["beta"] = beta
-        return losses
+        # Reset dead codes each epoch
+        codebook.quantizer.reset_dead_codes(all_encoder_outputs)
 ```
 
-#### Step 6: Training Config Extension
+#### Step 4: Codebook Analysis (the payoff)
+
+After Stage 1, run the analysis described in "What the Codebook Reveals":
+
+1. Extract code sequences for all 28 adapters
+2. Plot usage histogram, code-task heatmap, layer-position heatmap
+3. Measure reconstruction quality (DW MSE, delta cosine, downstream accuracy)
+4. Try code swapping experiments
+
+**This analysis alone is a contribution** — even before Stage 2, we'll know:
+- How many distinct layer-level adapter patterns exist
+- Whether patterns cluster by task
+- Whether early/late layer patterns are separable
+- The effective dimensionality of the adapter manifold
+
+#### Step 5: Stage 2 Training — Code Prediction from Text
+
+```python
+def train_code_predictor(
+    predictor: CodePredictor,
+    codebook: LoRACodebook,  # Frozen
+    text_encoder: nn.Module,  # Frozen
+    dataset: AdapterDWDataset,
+    config: VQTrainingConfig,
+):
+    """
+    Train text-to-code predictor with frozen codebook.
+
+    For each training adapter:
+    1. Encode + quantize to get teacher code sequence
+    2. Encode text condition
+    3. Predict code sequence from text
+    4. Cross-entropy loss against teacher codes
+    """
+    codebook.eval()
+    for p in codebook.parameters():
+        p.requires_grad = False
+
+    optimizer = torch.optim.AdamW(predictor.parameters(), lr=config.lr)
+
+    for epoch in range(config.num_epochs):
+        for sample in dataset:
+            # Get teacher codes (from frozen codebook)
+            with torch.no_grad():
+                layer_embeds = codebook.encode(sample["dw_tokens"])
+                _, _, teacher_codes = codebook.quantize(layer_embeds)
+
+            # Get text embedding
+            text_emb = text_encoder(sample["condition_ids"], sample["attention_mask"])
+
+            # Predict codes
+            predicted_logits = predictor(text_emb)
+
+            # Cross-entropy loss per level
+            loss = code_prediction_loss(predicted_logits, teacher_codes)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+```
+
+#### Step 6 (Optional): End-to-End Fine-Tuning
+
+After Stage 2 converges, optionally fine-tune the whole pipeline end-to-end
+with behavioral delta supervision:
+
+```
+text → predictor → codes → codebook.decode() → weights → FunctionalLoRA → delta
+                                                                           ↓
+                                                         Loss(delta, delta_teacher)
+```
+
+This requires making the code selection differentiable. Options:
+- **Gumbel-Softmax**: Differentiable approximation to argmax
+- **Straight-through**: Use argmax forward, softmax backward
+- **Soft codes**: Use softmax-weighted codebook lookup during fine-tuning
+
+---
+
+## Config
 
 ```python
 @dataclass
-class VAETrainingConfig(TrainingConfig):
-    """Extended config for VAE training."""
+class VQTrainingConfig:
+    """Configuration for VQ-LoRA training."""
 
-    # VAE settings
-    vae_mode: str = "gaussian"        # "gaussian" or "vq"
-    latent_dim: int = 64
-    num_vq_codes: int = 128
-    layer_code_dim: int = 32
+    # Base (inherited context)
+    base_model: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    use_small_model: bool = True
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    hidden_size: int = 896
+    num_layers: int = 24
 
-    # Loss weights
-    lambda_recon: float = 1.0
-    lambda_kl: float = 0.1
-    lambda_delta_vae: float = 1.0
-    lambda_consistency_vae: float = 0.5
+    # Codebook
+    num_codes: int = 64           # Codes per VQ level
+    embed_dim: int = 256          # Layer embedding dimension
+    num_rq_levels: int = 3        # Residual VQ levels
+    commitment_cost: float = 0.25
+    ema_decay: float = 0.99
+    dead_code_threshold: int = 2
+    base_dim: int = 64            # Base pattern dim (matches existing generator)
 
-    # Beta schedule
-    beta_schedule: str = "warmup"     # "constant", "warmup", "cyclical"
-    beta_max: float = 0.1
-    beta_warmup_steps: int = 200
+    # Cross-layer attention
+    use_cross_layer_attn: bool = True
+    cross_layer_heads: int = 4
+    cross_layer_depth: int = 2
 
-    # Canonical representation
-    canonical_method: str = "delta_w"  # "delta_w", "svd", "raw"
-    recon_target: str = "delta_w"     # What reconstruction loss compares
+    # Stage 1: Codebook training
+    stage1_lr: float = 3e-4
+    stage1_epochs: int = 200      # Many epochs needed for 28 samples
+    stage1_lambda_recon: float = 1.0
+    stage1_lambda_vq: float = 1.0
+    stage1_lambda_behavioral: float = 0.0  # Enable after basic recon works
+
+    # Stage 2: Code prediction
+    stage2_lr: float = 1e-4
+    stage2_epochs: int = 100
+    stage2_label_smoothing: float = 0.1
+    stage2_lambda_delta: float = 0.5
+
+    # Data
+    canonical_method: str = "svd_compact"
+    scaling: float = 2.0          # lora_alpha / lora_rank
+
+    # Analysis
+    run_codebook_analysis: bool = True
 ```
 
 ---
 
 ## Experiment Plan
 
-### Experiment 4b.1: Gaussian VAE Baseline
+### Exp 4b.1: Flat VQ Codebook (Baseline)
 
-**Config:**
-- `vae_mode="gaussian"`, `latent_dim=64`
-- `canonical_method="delta_w"` (gauge-fixed representation)
-- `beta_schedule="warmup"`, `beta_max=0.1`, `beta_warmup_steps=200`
-- `lambda_recon=1.0`, `lambda_delta_vae=1.0`
+- Single VQ level, K=256 codes, embed_dim=256
+- No cross-layer attention (each layer encoded independently)
+- Train on 25 adapters, validate on 3
 
-**Train on:** 25 qwen0.5lora checkpoints, hold out 3 for validation.
+**Questions answered:**
+- Can we reconstruct adapters from discrete codes at all?
+- How many codes does each adapter use?
+- What's the reconstruction quality ceiling?
 
-**Evaluate:**
-- Reconstruction quality: MSE(DW_pred, DW_teacher) and cosine similarity
-- Delta matching: cosine(d_computed, d_teacher)
-- Downstream accuracy: ARC-e, BoolQ, HellaSwag via `compute_accuracy_with_lora()`
-- Latent space quality: t-SNE of mu colored by task, interpolation smoothness
+### Exp 4b.2: Residual VQ
 
-**Success criteria:**
-- Reconstruction cosine > 0.8 on held-out adapters
-- Downstream accuracy within 3% of teacher adapters
-- Latent space shows task clustering
+- 3 RVQ levels, K=64 each
+- Measure reconstruction at each level (1, 2, 3)
+- How much does each level contribute?
 
-### Experiment 4b.2: VQ-VAE with Discrete Codes
+**Questions answered:**
+- Is adapter structure hierarchical (coarse + fine)?
+- How many levels are needed for good reconstruction?
+- Can we trade quality for efficiency by using fewer levels?
 
-**Config:**
-- `vae_mode="vq"`, `latent_dim=64`, `num_vq_codes=128`
-- Same beta/lambda as 4b.1
+### Exp 4b.3: Cross-Layer Dependencies
 
-**Evaluate:**
-- Same metrics as 4b.1
-- Additionally: codebook utilization (what fraction of codes are used),
-  code-to-task mapping (does each code correspond to a task?)
+- Add 2-layer transformer between encoder and quantizer
+- Compare: independent per-layer VQ vs cross-layer-aware VQ
 
-**Success criteria:**
-- Codebook utilization > 50% (no codebook collapse)
-- Sharper reconstructions than Gaussian VAE
-- Codes cluster by task family
+**Questions answered:**
+- Do layers share information useful for reconstruction?
+- Does cross-layer attention reduce codebook size needed?
+- Does it help with code reuse across layers?
 
-### Experiment 4b.3: Hierarchical Latent
+### Exp 4b.4: Code Prediction from Text (Stage 2)
 
-**Config:**
-- `layer_code_dim=32` (per-layer refinement)
-- Compare: flat `z` (64-dim) vs hierarchical `z_global` (64) + `z_layer` (24x32)
+- Train CodePredictor on frozen codebook
+- Evaluate: top-1 accuracy per layer, per level
+- Full pipeline: text → codes → weights → downstream eval
 
-**Evaluate:**
-- Does hierarchical structure improve reconstruction of layer-varying adapters?
-- Ablation: freeze `z_global` and vary `z_layer` — do individual layers change
-  independently?
+**Questions answered:**
+- Is the code prediction problem tractable?
+- How does code prediction accuracy translate to downstream accuracy?
+- Is this better than the current continuous generator?
 
-### Experiment 4b.4: Conditional Generation (the product)
+### Exp 4b.5: Code Swapping and Composition
 
-The real use case: generate adapters from task descriptions.
-
-```
-"Adapt model for ARC-style multiple choice reasoning" --> z --> LoRA weights
-```
-
-**Evaluate:**
-- Generate adapters for held-out task descriptions
-- Compare to nearest-neighbor retrieval baseline (Phase 5 B2)
-- Measure diversity: sample N adapters for same condition, measure variance
-
----
-
-## Training Protocol
-
-### Phase 4b.0: Validate Canonical Representation
-
-Before training any VAE, verify that:
-
-1. `DW = B @ A * scaling` reconstructs the adapter behavior
-   (compute delta from DW vs from original A,B — should be identical)
-2. SVD canonicalization is invertible: `from_svd_to_ab(to_svd_canonical(DW))` recovers
-   original DW within float precision
-3. Canonical form reduces variance across equivalent adapters (if we have any
-   augmented pairs)
-
-### Phase 4b.1: Train Reconstruction-Only VAE
-
-1. Load 25 qwen0.5lora checkpoints
-2. Extract and canonicalize LoRA weights
-3. Train VAE with `L_recon + beta * L_KL` only (no delta supervision)
-4. Validate: reconstruction quality on held-out 3 checkpoints
-5. Visualize latent space
-
-### Phase 4b.2: Add Behavioral Supervision
-
-1. Compute delta cache for all 28 checkpoints (reuse Phase 1 infrastructure)
-2. Add `L_delta` to the VAE loss
-3. Compare: recon-only vs recon+delta
-
-### Phase 4b.3: Full Pipeline
-
-1. End-to-end: text -> VAE -> LoRA -> delta -> loss
-2. Train with full `VAELoRALoss`
-3. Evaluate on held-out tasks
-4. Compare to Phase 4 (multi-task, no VAE) and Phase 5 (delta-only, no VAE)
+- Take adapter A's codes, swap layers 12-18 with adapter B's codes
+- Evaluate the hybrid adapter on both A's and B's tasks
+- Does code-level composition work better than weight interpolation?
 
 ---
 
 ## Parameter Budget
 
-For Qwen2.5-0.5B (24 layers, 7 targets/layer = 168 projections):
+| Component | Parameters | When |
+|-----------|-----------|------|
+| LayerEncoder (7 target projectors + fusion) | ~350K | Stage 1 |
+| VQ codebook (3 levels x 64 x 256d) | 49K | Stage 1 |
+| Cross-layer transformer (2 layers) | ~530K | Stage 1 |
+| LayerDecoder (7 target decoders + scales) | ~350K | Stage 1 |
+| **Stage 1 total** | **~1.3M** | |
+| | | |
+| Text encoder (frozen MiniLM) | 22M (frozen) | Stage 2 |
+| CodePredictor (proj + cross-attn + heads) | ~800K | Stage 2 |
+| **Stage 2 total** | **~800K trainable** | |
 
-| Component | Parameters |
-|-----------|-----------|
-| Text encoder (frozen MiniLM) | 22M (frozen) |
-| Shared projection (384->512) | ~200K |
-| VAE encoder (512->512->64 mu+logvar) | ~400K |
-| Hierarchical decoder (64->24*32, per-target MLPs) | ~1.5M |
-| Per-target weight decoders (7 shared, 321->2048 each) | ~1M |
-| Delta-from-z head (64->512->896) | ~500K |
-| Scales (168 x 2) | 336 |
-| **Total trainable** | **~3.6M** |
-
-Comparable to the current `LoRAGeneratorWithDeltaHead` (~3-4M params).
-The VAE adds ~400K for the encoder and reuses the decoder budget.
+Much smaller than the current generator (~3.6M). The codebook itself is only
+49K parameters — the information is in the codes, not in a large network.
 
 ---
 
@@ -810,94 +1124,85 @@ The VAE adds ~400K for the encoder and reuses the decoder budget.
 
 | Risk | Likelihood | Mitigation |
 |------|-----------|------------|
-| **KL collapse** (posterior = prior, ignoring z) | High | Beta annealing; start with beta=0; free bits; use delta supervision to force z to carry information |
-| **Blurry reconstruction** (Gaussian prior averages modes) | Medium | Upgrade to VQ-VAE (Exp 4b.2); use cosine loss instead of MSE |
-| **Codebook collapse** (VQ-VAE uses few codes) | Medium | EMA codebook update; codebook reset for dead codes; entropy regularization |
-| **Gauge ambiguity** (despite canonicalization) | Low | DW-space is unique; validate in Phase 4b.0 |
-| **Overfitting** (28 checkpoints is small) | High | Strong regularization via KL; data augmentation (noise on weights); hold out 3 for validation |
-| **Memory pressure** (VAE + base model + delta computation) | Medium | Reuse existing memory management patterns; gradient checkpointing; sequential delta computation |
+| **Codebook collapse** (few codes used) | High with 28 samples | EMA updates; dead code reset; start with small K; entropy bonus on code usage |
+| **Poor reconstruction** (discretization too lossy) | Medium | RVQ adds levels until quality sufficient; increase embed_dim; behavioral recon loss |
+| **Overfitting codebook to 28 adapters** | High | Heavy augmentation (noise, interpolation, partial); small K; strong EMA decay |
+| **Stage 2 prediction too hard** | Medium | Label smoothing; soft-code predictions; Gumbel-Softmax fine-tuning |
+| **Cross-layer attention hurts** (adds params for small data) | Medium | Ablate (Exp 4b.3); use lightweight version (1 layer, 2 heads) |
 
-### Data Augmentation for Small Dataset
+### Data Augmentation (Critical for 28 Samples)
 
-28 checkpoints is small. Augment by:
+1. **Weight noise**: Add Gaussian noise (sigma=0.01) to DW before encoding.
+   Same adapter, slightly different tokens → encoder learns to be robust.
+2. **Layer dropout**: Randomly zero out 1-3 layers' DW → encoder learns
+   that some layers can be "identity" (code for zero-effect).
+3. **Synthetic interpolation**: Interpolate DW between pairs of adapters
+   in weight space → fill gaps between known points.
+4. **Sub-adapter extraction**: Each checkpoint contains intermediate training
+   states. Extract adapters at multiple training steps for more diversity.
+5. **Per-layer shuffling**: Some layers may be interchangeable across adapters.
+   Create synthetic adapters by mixing layers from different teachers.
 
-1. **Noise injection:** Add Gaussian noise to teacher weights, creating synthetic
-   neighbors in weight space
-2. **Interpolation:** Create synthetic adapters by interpolating between pairs
-   of teacher adapters (in DW-space)
-3. **Partial adapters:** Use subsets of layers (zero out some layers' LoRA) as
-   additional training examples
-4. **Cross-checkpoint:** If training logs have intermediate checkpoints,
-   use those as additional data points along the optimization trajectory
+With 5x augmentation: 28 × 5 = 140 effective samples, 140 × 24 = 3,360
+layer-level training examples.
 
 ---
 
 ## Comparison Table (Expected)
 
-| Method | Recon Cos | Delta Cos | ARC-e | BoolQ | HellaSwag | Latent Structure |
-|--------|-----------|-----------|-------|-------|-----------|-----------------|
-| Phase 4 (multi-task, no VAE) | N/A | 0.7-0.8 | X% | X% | X% | None |
-| Phase 5 (delta-only) | N/A | 0.8-0.9 | X% | X% | X% | None |
-| **4b.1: Gaussian VAE** | 0.8+ | 0.7-0.8 | X% | X% | X% | Smooth, some blur |
-| **4b.2: VQ-VAE** | 0.85+ | 0.75-0.85 | X% | X% | X% | Discrete, sharp |
-| **4b.3: Hierarchical** | 0.85+ | 0.8+ | X% | X% | X% | Layer-aware |
-| **4b.4: Conditional gen** | 0.7+ | 0.7+ | X% | X% | X% | Task-conditioned |
+| Method | Recon Cos | Delta Cos | ARC-e | BoolQ | HellaSwag | Inference Cost |
+|--------|-----------|-----------|-------|-------|-----------|---------------|
+| Phase 4 (continuous gen) | N/A | 0.7-0.8 | X% | X% | X% | ~50ms (MLP) |
+| Phase 5 (delta-only) | N/A | 0.8-0.9 | X% | X% | X% | ~50ms (MLP) |
+| **4b.1: Flat VQ** | 0.7+ | 0.6-0.7 | X% | X% | X% | ~1ms (lookup) |
+| **4b.2: RVQ 3-level** | 0.85+ | 0.75-0.85 | X% | X% | X% | ~3ms (3 lookups) |
+| **4b.3: + cross-layer** | 0.85+ | 0.8+ | X% | X% | X% | ~3ms |
+| **4b.4: text → codes** | 0.8+ | 0.75+ | X% | X% | X% | ~5ms (classify + lookup) |
+
+Inference cost estimates: codebook lookup is O(K*d) per layer, vs O(d^2)
+for MLP decoding. With K=64, d=256, this is 64x faster.
 
 ---
 
 ## Deliverables
 
-1. **`llgbm/canonical.py`** — Gauge-fixing utilities (DW-space, SVD canonical)
-2. **`llgbm/vae.py`** — VAE encoder, decoder, VQ layer, hierarchical decoder
-3. **`llgbm/generator.py`** — `LoRAGeneratorVAE` class
-4. **`llgbm/losses.py`** — `VAELoRALoss` with beta annealing
-5. **`llgbm/dataset.py`** — `DnDCheckpointDataset` for HF .pth files
-6. **`phase_4b_vae_lora.ipynb`** — End-to-end notebook for all experiments
-7. **Latent space visualizations** — t-SNE, interpolation plots, codebook usage
-8. **Comparison table** — Filled in with actual numbers from experiments
+1. **`llgbm/canonical.py`** — Gauge-fixing: DW computation, SVD compact tokens
+2. **`llgbm/codebook.py`** — `VectorQuantizer`, `ResidualVQ`, `LoRACodebook`
+3. **`llgbm/code_predictor.py`** — `CodePredictor` (text → code sequence)
+4. **`llgbm/losses.py`** additions — `CodebookLoss`, `CodePredictionLoss`
+5. **`llgbm/dataset.py`** additions — `AdapterDWDataset`
+6. **`phase_4b_vq_lora.ipynb`** — Full pipeline notebook
+7. **Codebook analysis** — Usage histograms, task heatmaps, layer heatmaps
+8. **Code swapping experiments** — Discrete compositionality results
 
 ## Acceptance Criteria
 
-- [ ] Canonical representation is validated (Phase 4b.0)
-- [ ] VAE trains stably without KL collapse (active KL > 0.1 nats)
-- [ ] Reconstruction cosine similarity > 0.8 on held-out checkpoints
-- [ ] Generated adapters improve over base model on at least 2 tasks
-- [ ] Latent space shows interpretable structure (task clustering in t-SNE)
-- [ ] Interpolation between two task adapters produces smoothly varying behavior
-- [ ] VQ-VAE codebook utilization > 50%
+- [ ] DW-space canonical representation validated (roundtrip error < 1e-3)
+- [ ] Stage 1 codebook trains stably; codebook utilization > 50%
+- [ ] RVQ reconstruction cosine > 0.8 on held-out adapters
+- [ ] Codebook analysis reveals interpretable task/layer structure
+- [ ] Stage 2 code prediction accuracy > 70% per layer (top-1)
+- [ ] End-to-end generated adapters improve over base model on 2+ tasks
+- [ ] Code swapping produces viable hybrid adapters
 
 ## Relationship to Other Phases
 
 ```
-Phase 4  (multi-task)
-    |
-    +---> Phase 4b (VAE bottleneck) <-- you are here
-    |         |
-    |         +---> 4b.1 Gaussian VAE
-    |         +---> 4b.2 VQ-VAE
-    |         +---> 4b.3 Hierarchical
-    |         +---> 4b.4 Conditional generation
-    |
-Phase 5  (delta-only)
-    |
-Phase 6  (compositionality) <-- VAE latent space enables better composition
+Phase 4  (multi-task, continuous generator)
+    │
+    ├──→ Phase 4b (discrete codebook)     ← you are here
+    │        │
+    │        ├──→ 4b.1 Flat VQ baseline
+    │        ├──→ 4b.2 Residual VQ
+    │        ├──→ 4b.3 Cross-layer attention
+    │        ├──→ 4b.4 Text → code prediction
+    │        └──→ 4b.5 Code swapping / composition
+    │
+Phase 5  (delta-only supervision)
+    │
+Phase 6  (compositionality) ← code swapping is discrete compositionality
 ```
 
-Phase 4b is orthogonal to Phase 5 (delta-only) — they can proceed in parallel.
-Phase 6 (compositionality) benefits from VAE because interpolation/composition
-in latent space is better-behaved than in raw weight space.
-
----
-
-## Next Steps After 4b
-
-If the VAE approach works:
-
-1. **Scale to 1.5B family** — Use the 3 qwen1.5lora checkpoints for transfer
-   learning (fine-tune the latent decoder, keep encoder frozen)
-2. **Cross-task generation** — Generate adapters for tasks not seen in training
-   (zero-shot in adapter space)
-3. **Adapter search** — Use the latent space for efficient search over adapter
-   configurations (Bayesian optimization in z-space)
-4. **Publication angle** — "Structured Latent Spaces for LoRA Generation"
-   combining gauge fixing + hierarchical VAE + behavioral supervision
+Phase 4b subsumes much of Phase 6: code-level composition is a cleaner
+version of weight-space interpolation. If codes are interpretable, we
+get compositionality "for free."
