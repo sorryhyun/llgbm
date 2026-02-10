@@ -28,6 +28,7 @@ from llgbm.losses import (
     DeltaOnlyLoss,
     DeltaGuidedLoss,
     WeightLoss,
+    DeltaWLoss,
 )
 from llgbm.training import (
     TrainingConfig,
@@ -106,7 +107,7 @@ class AblationConfig:
 
     # Experiment settings
     # Each config can specify:
-    # - mode: "multitask" | "delta_only" | "weight_only" | "delta_guided"
+    # - mode: "multitask" | "delta_only" | "weight_only" | "delta_w" | "delta_guided"
     # - lambda_weight, lambda_delta (for multitask/weight/delta-only)
     # - lambda_pred, lambda_computed, lambda_consistency, compute_delta_every_n_steps (for delta_guided)
     configs: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
@@ -171,6 +172,9 @@ def _infer_mode(name: str, params: Dict[str, Any]) -> str:
     if lw <= 0 and ld > 0:
         return "delta_only"
     if ld <= 0 and lw > 0:
+        # Check if delta_w is indicated by a weight_criterion hint
+        if params.get("weight_criterion") == "delta_w":
+            return "delta_w"
         return "weight_only"
     if lw > 0 and ld > 0:
         return "multitask"
@@ -473,6 +477,14 @@ def run_trial(
 
     # Get weight criterion for direct weight supervision
     weight_criterion = components.get("weight_criterion")
+
+    # delta_w mode: use DeltaWLoss as weight_criterion (no hidden-state delta needed)
+    if mode == "delta_w":
+        criterion = MultiTaskLoss(lambda_weight=1.0, lambda_delta=0.0)
+        weight_criterion = DeltaWLoss(
+            lora_alpha=base_config.lora_alpha,
+            lora_rank=base_config.lora_rank,
+        )
 
     # Optimizer & scheduler
     optimizer = AdamW(generator.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)

@@ -55,7 +55,8 @@ python train_lora_adapters.py \
 | `delta.py` | `compute_base_activation()`, `compute_adapter_delta()`, `DeltaCache` |
 | `dataset.py` | `DeltaAugmentedDataset`, `Text2Qwen25LoRA_DeltaDataset`, `RealAdapterDataset`, `create_dataloader()` |
 | `functional.py` | `FunctionalLoRA`, `compute_delta_differentiable()` |
-| `training.py` | `TrainingConfig`, `MultiTaskLoss`, `DeltaOnlyLoss`, `train()`, `evaluate()` |
+| `losses.py` | `WeightLoss`, `DeltaWLoss`, `MultiTaskLoss`, `DeltaOnlyLoss`, `DeltaGuidedLoss` |
+| `training.py` | `TrainingConfig`, `train()`, `evaluate()` |
 | `text_encoder.py` | `PretrainedTextEncoder`, `EmbeddingCache` |
 | `generator.py` | `LoRAGenerator`, `create_generator()` |
 | `evaluation.py` | `compute_accuracy_with_lora()`, `evaluate_all_tasks()` |
@@ -83,15 +84,14 @@ Text Prompts
 
 ## Notebooks
 
-| Notebook | Phase | Focus |
-|----------|-------|-------|
-| `phase_0_baseline.ipynb` | 0 | DnD reproduction |
-| `phase_1_delta.ipynb` | 1 | Delta computation + caching |
-| `phase_2_dataset.ipynb` | 2 | Dataset with delta labels |
-| `phase_3_differentiable.ipynb` | 3 | Differentiable delta via `torch.func.functional_call` |
-| `phase_4_multitask.ipynb` | 4 | Multi-task training (weights + deltas) |
-| `phase_4_5_ablations.ipynb` | 4.5 | Ablation studies (3 trials × 3 configs) |
-| `phase_5_delta_only.ipynb` | 5 | Delta-only training (behavioral supervision only) |
+| Notebook | Focus |
+|----------|-------|
+| `toy_baseline.ipynb` | Weight-only baseline (raw A, B MSE) |
+| `toy_delta_w.ipynb` | Delta-W supervision (MSE on B@A*scaling, gauge-invariant) |
+| `phase_4_multitask.ipynb` | Multi-task training (weights + deltas) |
+| `phase_4_5_ablations.ipynb` | Ablation studies (3 trials × N configs) |
+| `phase_5_delta_only.ipynb` | Delta-only training (behavioral supervision only) |
+| `train_lora_adapters.ipynb` | Train teacher LoRA adapters |
 
 ## Key Abstractions
 

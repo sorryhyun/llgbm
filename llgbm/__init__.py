@@ -20,6 +20,7 @@ from llgbm.functional import (
 )
 from llgbm.losses import (
     WeightLoss,
+    DeltaWLoss,
     MultiTaskLoss,
     DeltaOnlyLoss,
     DeltaGuidedLoss,
@@ -99,6 +100,7 @@ __all__ = [
     "DeltaOnlyLoss",
     "DeltaGuidedLoss",
     "WeightLoss",
+    "DeltaWLoss",
     "compute_delta_for_batch",
     "save_checkpoint",
     "load_checkpoint",

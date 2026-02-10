@@ -19,12 +19,13 @@ from tqdm.auto import tqdm
 from llgbm.functional import FunctionalLoRA, compute_delta_differentiable
 from llgbm.losses import (
     WeightLoss,
+    DeltaWLoss,
     MultiTaskLoss,
     DeltaGuidedLoss,
 )
 
 # Re-export for backward compatibility
-__all__ = ["WeightLoss", "MultiTaskLoss", "DeltaGuidedLoss"]
+__all__ = ["WeightLoss", "DeltaWLoss", "MultiTaskLoss", "DeltaGuidedLoss"]
 
 
 @dataclass

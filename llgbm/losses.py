@@ -111,6 +111,119 @@ class WeightLoss(nn.Module):
         return total_loss
 
 
+class DeltaWLoss(nn.Module):
+    """
+    MSE loss on effective weight updates DW = B @ A * scaling.
+
+    Instead of comparing raw (A, B) matrices (which suffer from gauge ambiguity—
+    many A,B pairs produce the same function), this loss compares the actual
+    weight perturbation applied to the base model. This is both canonical
+    (gauge-invariant) and cheap (matrix multiply, no forward pass required).
+    """
+
+    def __init__(
+        self,
+        lora_alpha: int = 16,
+        lora_rank: int = 8,
+        reduction: str = "mean",
+    ):
+        """
+        Args:
+            lora_alpha: LoRA alpha for scaling
+            lora_rank: LoRA rank for scaling
+            reduction: "mean" or "sum" for loss reduction
+        """
+        super().__init__()
+        self.scaling = lora_alpha / lora_rank
+        self.reduction = reduction
+        self.last_debug: Dict[str, Any] = {}
+
+    def forward(
+        self,
+        weights_pred: List[Dict[str, torch.Tensor]],
+        weights_teacher: List[Dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        """
+        Compute MSE between predicted and teacher effective weight updates.
+
+        For each batch item, pairs lora_A and lora_B matrices by module prefix,
+        computes DW = B @ A * scaling, then takes MSE(DW_pred, DW_teacher).
+
+        Args:
+            weights_pred: List of weight dicts (one per batch item)
+            weights_teacher: List of teacher weight dicts (one per batch item)
+
+        Returns:
+            Scalar MSE loss
+        """
+        total_loss = 0.0
+        count = 0
+        matched_modules = 0
+
+        for pred, teacher in zip(weights_pred, weights_teacher):
+            pred_canon = {_canonicalize_lora_key(k): v for k, v in pred.items()}
+            teacher_canon = {_canonicalize_lora_key(k): v for k, v in teacher.items()}
+
+            # Group keys by module prefix: split on ".lora_A." or ".lora_B."
+            pred_pairs = self._group_ab_pairs(pred_canon)
+            teacher_pairs = self._group_ab_pairs(teacher_canon)
+
+            for prefix in pred_pairs:
+                if prefix not in teacher_pairs:
+                    continue
+                p_A, p_B = pred_pairs[prefix]
+                t_A, t_B = teacher_pairs[prefix]
+                if p_A is None or p_B is None or t_A is None or t_B is None:
+                    continue
+
+                p_A, p_B = p_A.float(), p_B.float()
+                t_A, t_B = t_A.float(), t_B.float().to(p_A.device)
+
+                # DW = B @ A * scaling
+                dw_pred = p_B @ p_A * self.scaling
+                dw_teacher = t_B @ t_A * self.scaling
+
+                if dw_pred.shape != dw_teacher.shape:
+                    continue
+
+                matched_modules += 1
+                if self.reduction == "mean":
+                    total_loss += F.mse_loss(dw_pred, dw_teacher, reduction="sum")
+                    count += dw_pred.numel()
+                else:
+                    total_loss += F.mse_loss(dw_pred, dw_teacher, reduction="sum")
+                    count += 1
+
+        self.last_debug = {"matched_modules": matched_modules, "matched_numel": count}
+
+        if count == 0:
+            device = "cpu"
+            if weights_pred and weights_pred[0]:
+                device = next(iter(weights_pred[0].values())).device
+            return torch.zeros((), device=device, requires_grad=True)
+
+        if self.reduction == "mean":
+            return total_loss / count
+        return total_loss
+
+    @staticmethod
+    def _group_ab_pairs(
+        canon: Dict[str, torch.Tensor],
+    ) -> Dict[str, tuple]:
+        """Group canonicalized keys into (A, B) pairs by module prefix."""
+        pairs: Dict[str, list] = {}  # prefix -> [A, B]
+        for key, tensor in canon.items():
+            if ".lora_A." in key:
+                prefix = key.split(".lora_A.")[0]
+                pairs.setdefault(prefix, [None, None])
+                pairs[prefix][0] = tensor
+            elif ".lora_B." in key:
+                prefix = key.split(".lora_B.")[0]
+                pairs.setdefault(prefix, [None, None])
+                pairs[prefix][1] = tensor
+        return {k: tuple(v) for k, v in pairs.items()}
+
+
 class MultiTaskLoss(nn.Module):
     """
     Combined loss for multi-task training.
